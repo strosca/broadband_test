@@ -1,0 +1,32 @@
+# Konfiguration von linkmon. Kopiere diese Datei nach config.toml.
+# Relative Pfade gelten relativ zu dieser Datei.
+
+[general]
+data_dir = "data"              # Messdaten (CSV), Logs und Berichte
+timezone = "Europe/Berlin"     # Lokale Zeit in Berichten und Webinterface
+
+[reachability]
+interval_s = 3                 # 1 bis 60, empfohlen 2 bis 5
+failure_threshold = 3          # So viele fehlerhafte Prüfungen in Folge eröffnen einen Ausfall
+recovery_threshold = 2         # So viele fehlerfreie Prüfungen in Folge beenden ihn
+lan_targets = "auto"           # "auto" oder Liste, z. B. ["192.168.0.1"]
+isp_hop = "auto"               # "auto" (per Traceroute) oder feste IP
+external_targets = ["1.1.1.1", "8.8.8.8"]
+dns_names = ["www.google.com", "www.cloudflare.com"]
+https_urls = ["https://www.google.com/generate_204", "https://www.cloudflare.com/cdn-cgi/trace"]
+ping_timeout_s = 1.5
+dns_timeout_s = 2.0
+https_timeout_s = 3.0
+
+[dashboard]
+enabled = true                 # Webinterface läuft im Messdienst mit
+host = "127.0.0.1"             # Nur lokal. Eine andere Adresse macht die Daten im Netz sichtbar.
+port = 8050
+refresh_s = 30
+
+[report]
+# Optional, erscheint auf der ersten Seite des Berichts:
+tariff = "Vodafone Kabel 250"
+# customer_name = ""
+# customer_number = ""
+# address = ""
