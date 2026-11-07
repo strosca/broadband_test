@@ -1,0 +1,15 @@
+[Unit]
+Description=Dauermessung des Breitbandanschlusses (linkmon)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@ROOT@
+ExecStart=@ROOT@/.venv/bin/linkmon --config @ROOT@/config.toml run
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

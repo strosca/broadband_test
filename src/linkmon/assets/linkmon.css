@@ -1,0 +1,268 @@
+/* Dunkles Layout von linkmon. Schriften kommen vom System: Die Seite muss auch ohne Internet gleich aussehen. */
+:root {
+  color-scheme: dark;
+  --page: #0d0d0d;
+  --surface: #1a1a19;
+  --surface-raised: #232322;
+  --ink: #f0efec;
+  --ink-2: #c3c2b7;
+  --ink-3: #898781;
+  --grid: #2c2c2a;
+  --line: rgba(255, 255, 255, 0.10);
+  --accent: #3987e5;
+  --good: #0ca30c;
+  --warning: #fab219;
+  --critical: #d03b3b;
+
+  /* Farben der mitgelieferten Dash-Bedienelemente, etwa des Kalenders */
+  --Dash-Fill-Inverse-Strong: var(--surface-raised) !important;
+  --Dash-Fill-Interactive-Strong: var(--accent) !important;
+  --Dash-Fill-Interactive-Weak: rgba(255, 255, 255, 0.08) !important;
+  --Dash-Fill-Primary-Hover: rgba(255, 255, 255, 0.10) !important;
+  --Dash-Fill-Primary-Active: rgba(255, 255, 255, 0.16) !important;
+  --Dash-Fill-Disabled: var(--grid) !important;
+  --Dash-Text-Primary: var(--ink) !important;
+  --Dash-Text-Strong: var(--ink) !important;
+  --Dash-Text-Weak: var(--ink-2) !important;
+  --Dash-Text-Disabled: var(--ink-3) !important;
+  --Dash-Stroke-Strong: var(--line) !important;
+  --Dash-Stroke-Weak: var(--line) !important;
+  --Dash-Shading-Strong: rgba(0, 0, 0, 0.5) !important;
+  --Dash-Shading-Weak: rgba(0, 0, 0, 0.3) !important;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  background: var(--page);
+  color: var(--ink);
+  font-family: "Inter", "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, Roboto, sans-serif;
+  font-size: 14px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+
+.shell { max-width: 1480px; margin: 0 auto; padding: 0 28px 40px; }
+
+/* Kopfzeile */
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 20px;
+  padding: 14px 0;
+  background: var(--page);
+}
+.brand { display: flex; align-items: center; gap: 10px; }
+.brand-mark {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 17px;
+  font-weight: 700;
+}
+.brand-title { font-size: 16px; font-weight: 650; letter-spacing: -0.01em; }
+.controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+
+/* Umschalter */
+.segmented, .segmented > div {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 2px;
+}
+.segmented { padding: 3px; border-radius: 9px; background: var(--surface); border: 1px solid var(--line); }
+.segmented label {
+  position: relative;
+  display: inline-flex !important;
+  align-items: center;
+  margin: 0 !important;
+  padding: 5px 12px;
+  border-radius: 6px;
+  color: var(--ink-2);
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+.segmented label:hover { color: var(--ink); background: rgba(255, 255, 255, 0.05); }
+.segmented label:has(input:checked) { color: var(--ink); background: rgba(255, 255, 255, 0.14); }
+.segmented label:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 1px; }
+.segmented input { position: absolute; opacity: 0; width: 0; height: 0; margin: 0; }
+
+/* Schalter im Kartenkopf */
+.toggles, .toggles > div { display: inline-flex; flex-wrap: wrap; gap: 6px; }
+.toggles label {
+  display: inline-flex !important;
+  align-items: center;
+  gap: 7px;
+  margin: 0 !important;
+  padding: 4px 11px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--ink-2);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.toggles label:hover { color: var(--ink); }
+.toggles label:has(input:checked) { color: var(--ink); border-color: var(--accent); background: rgba(57, 135, 229, 0.16); }
+.toggles label:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 1px; }
+.toggles input { position: absolute; opacity: 0; width: 0; height: 0; margin: 0; }
+
+/* Karten */
+.card {
+  min-width: 0;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+}
+.card-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  padding: 16px 20px 6px;
+}
+.card-title { margin: 0; font-size: 14px; font-weight: 600; }
+.card-note { color: var(--ink-3); font-size: 12px; }
+
+/* Zustand */
+.hero {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px 40px;
+  padding: 20px 24px;
+  margin-bottom: 12px;
+}
+.hero-main { display: flex; align-items: center; gap: 16px; min-width: 260px; }
+.hero-badge {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  font-size: 23px;
+  font-weight: 700;
+  color: #fff;
+}
+.tone-good .hero-badge { background: var(--good); }
+.tone-warning .hero-badge { background: var(--warning); color: #0b0b0b; }
+.tone-critical .hero-badge { background: var(--critical); }
+.tone-unknown .hero-badge { background: var(--grid); color: var(--ink-2); }
+.hero-title { font-size: 24px; font-weight: 650; letter-spacing: -0.015em; line-height: 1.2; }
+.hero-note { color: var(--ink-2); font-size: 13px; margin-top: 2px; }
+.hero-facts { display: flex; flex-wrap: wrap; gap: 14px 36px; }
+.fact-label { color: var(--ink-3); font-size: 12px; }
+.fact-value { display: flex; align-items: center; gap: 7px; color: var(--ink); font-size: 14px; font-weight: 500; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-3); }
+.dot-live { background: var(--good); box-shadow: 0 0 0 3px rgba(12, 163, 12, 0.22); }
+
+.callout {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  padding: 10px 16px;
+  border: 1px solid rgba(250, 178, 25, 0.45);
+  border-radius: 10px;
+  background: rgba(250, 178, 25, 0.10);
+  color: var(--ink);
+  font-size: 13px;
+}
+.callout-icon { color: var(--warning); font-weight: 700; }
+
+/* Kennzahlen */
+.kpis {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(210px, 100%), 1fr));
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.kpi { padding: 16px 20px; }
+.kpi-label { color: var(--ink-2); font-size: 13px; }
+.kpi-value {
+  margin-top: 4px;
+  font-size: 30px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+  font-variant-numeric: tabular-nums;
+}
+.kpi-unit { margin-left: 5px; color: var(--ink-3); font-size: 13px; font-weight: 500; letter-spacing: 0; }
+.kpi-note { margin-top: 6px; color: var(--ink-3); font-size: 12px; font-variant-numeric: tabular-nums; }
+.meter { height: 4px; margin-top: 12px; border-radius: 2px; background: var(--grid); overflow: hidden; }
+.meter-fill { height: 100%; border-radius: 2px; }
+
+/* Verlauf */
+.chart-card { margin-bottom: 12px; padding-bottom: 8px; }
+.chart-hint { padding: 0 20px 8px; color: var(--ink-3); font-size: 12px; }
+
+/* Zwei Karten nebeneinander, auf schmalen Bildschirmen untereinander */
+.grid-2 {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(460px, 100%), 1fr));
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.grid-2 > .card { padding-bottom: 8px; }
+
+/* Kennzahlen je Strecke */
+.stats-wrap { padding: 4px 20px 6px; overflow-x: auto; }
+.stats-table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+.stats-table th {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  color: var(--ink-3);
+  font-size: 12px;
+  font-weight: 500;
+  text-align: right;
+  white-space: nowrap;
+}
+.stats-table td { padding: 9px 10px; border-bottom: 1px solid var(--grid); text-align: right; white-space: nowrap; }
+.stats-table th:first-child, .stats-table td:first-child { padding-left: 0; text-align: left; }
+.stats-table tr:last-child td { border-bottom: 0; }
+.track-name { display: flex; align-items: center; gap: 9px; color: var(--ink); }
+.swatch { flex: none; width: 10px; height: 10px; border-radius: 3px; }
+.swatch-empty { border: 1px solid var(--ink-3); }
+
+/* Datumswahl */
+.dates-wrap .dash-datepicker-input-wrapper { background: var(--surface); border-radius: 9px; }
+.dates-wrap input { background: transparent; color: var(--ink); }
+
+/* Tabelle */
+.table-card { padding-bottom: 12px; }
+.table-wrap { padding: 8px 20px 0; }
+.table-wrap .dash-spreadsheet-container .dash-spreadsheet-inner input:not([type=radio]):not([type=checkbox]) {
+  color: var(--ink) !important;
+}
+.table-wrap .dash-filter input::placeholder { color: var(--ink-3) !important; opacity: 1; }
+.table-wrap .dash-cell a, .table-wrap .dash-cell-value a { color: #6da7ee; text-decoration: none; }
+.table-wrap .dash-cell a:hover, .table-wrap .dash-cell-value a:hover { text-decoration: underline; }
+.table-wrap .dash-cell-value p { margin: 0; }
+.table-wrap .column-header--sort { color: var(--ink-3) !important; }
+.table-wrap .previous-next-container { margin-top: 10px; color: var(--ink-2); }
+.table-wrap .previous-next-container button { background: transparent; color: var(--ink-2); border: 0; cursor: pointer; }
+.table-wrap .previous-next-container button:disabled { color: var(--grid); cursor: default; }
+.table-wrap .previous-next-container input { background: var(--surface-raised) !important; color: var(--ink) !important; border: 1px solid var(--line); border-radius: 5px; }
+.table-wrap .previous-next-container .current-page-container .current-page-shadow { color: var(--ink); }
+
+@media (max-width: 720px) {
+  .shell { padding: 0 14px 28px; }
+  .topbar { position: static; }
+  .hero { padding: 16px; }
+  .hero-title { font-size: 20px; }
+}
