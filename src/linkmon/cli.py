@@ -260,9 +260,7 @@ def _cmd_status(config: Config, _args: argparse.Namespace) -> int:
 
     print(f"Webinterface: {', '.join(listen_urls(config.dashboard.host, config.dashboard.port))} "
           "(solange der Messdienst läuft)")
-    home_dns = [host for host in net.system_nameservers() if net.is_home_dns_server(host)]
-    print(f"DNS-Server: {', '.join(net.system_nameservers()) or '-'}"
-          + (f", davon im Heimnetz (Pi-hole): {', '.join(home_dns)}" if home_dns else ""))
+    print(f"DNS-Server: {', '.join(net.system_nameservers()) or '-'}")
     print(f"Prüfung: alle {reach.interval_s:g} s, Ziele {', '.join(reach.external_targets)}, DNS, HTTPS")
     info = collect_host_info()
     print(f"Gerät: {info.hostname}, Interface {info.interface}, {info.connection_type}, {info.link_mbps} Mbit/s")

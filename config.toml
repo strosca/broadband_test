@@ -13,7 +13,7 @@ lan_targets = "auto"           # "auto" oder Liste, z. B. ["192.168.0.1"]
 isp_hop = "auto"               # "auto" (per Traceroute) oder feste IP
 external_targets = ["1.1.1.1", "8.8.8.8"]
 dns_names = ["www.google.com", "www.cloudflare.com"]
-dns_home_servers = "auto"         # Eigener DNS-Server (Pi-hole): "auto" = private System-DNS-Server, [] = aus
+dns_home_servers = []            # Eigenen DNS-Server (Pi-hole) einzeln prüfen: "auto" oder Liste, [] = aus
 dns_reference_servers = ["1.1.1.1", "8.8.8.8"]  # Öffentlicher Vergleich: trennt Pi-hole- von Anbieterstörungen
 https_urls = ["https://www.google.com/generate_204", "https://www.cloudflare.com/cdn-cgi/trace"]
 ping_timeout_s = 1.5

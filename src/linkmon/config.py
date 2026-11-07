@@ -34,8 +34,8 @@ class Reachability:
     isp_hop: str = "auto"
     external_targets: list[str] = field(default_factory=lambda: ["1.1.1.1", "8.8.8.8"])
     dns_names: list[str] = field(default_factory=lambda: ["www.google.com", "www.cloudflare.com"])
-    # DNS-Server im Heimnetz (Pi-hole): "auto" nimmt die privaten Adressen unter den System-DNS-Servern.
-    dns_home_servers: str | list[str] = "auto"
+    # DNS-Server im Heimnetz (Pi-hole) einzeln prüfen. Aus ([]), "auto" nimmt die privaten System-DNS-Server.
+    dns_home_servers: str | list[str] = field(default_factory=list)
     # Öffentliche Server zum Vergleich. Leer schaltet den Vergleich ab.
     dns_reference_servers: list[str] = field(default_factory=lambda: ["1.1.1.1", "8.8.8.8"])
     https_urls: list[str] = field(

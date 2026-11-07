@@ -150,18 +150,14 @@ dazu eine DNS-Abfrage und einen HTTPS-Abruf. Maßgeblich für einen Ausfall ist 
 | Lokal | Messgerät ohne aktive Verbindung oder Standardroute |
 | Router/LAN | Ein Router im Heimnetz antwortet nicht. Bei zwei Routern steht der betroffene im Befund |
 | Leitung | Router erreichbar, aber **alle** externen Ziele nicht |
-| DNS Heimnetz (Pi-hole) | Der eigene DNS-Server im Heimnetz antwortet nicht, ein öffentlicher DNS-Server direkt gefragt schon |
+| DNS Heimnetz (Pi-hole) | Nur mit `dns_home_servers`: Der eigene DNS-Server antwortet nicht, ein öffentlicher schon |
 | Nur DNS | Externe Ziele erreichbar, DNS scheitert auch beim öffentlichen Server, oder der DNS des Anbieters ist gestört |
 | Nur HTTPS | DNS und externe Ziele in Ordnung, HTTPS scheitert |
 
-**Pi-hole und andere eigene DNS-Server.** Ein Pi-hole ist ein Gerät im Heimnetz. Fällt er aus, scheitert DNS, obwohl
-die Leitung in Ordnung ist. Damit das nicht dem Anbieter angelastet wird, fragt jede Runde drei Wege ab: DNS so, wie es
-dieses Gerät nutzt, jeden privaten DNS-Server aus der Systemeinstellung (den Pi-hole) einzeln und einen öffentlichen
-Server (1.1.1.1, 8.8.8.8) direkt. Antwortet der öffentliche, liegt die Störung im Heimnetz. Ein ausgefallener Pi-hole fällt
-auch auf, wenn dieser Rechner unbemerkt auf einen Ausweich-DNS wie 1.1.1.1 umschaltet: Andere Geräte haben oft nur den
-Pi-hole eingetragen. Eine Sperrantwort des Pi-hole (`0.0.0.0`) für die Testnamen zählt als Fehler. Eingestellt wird das
-mit `dns_home_servers` und `dns_reference_servers` in `[reachability]`, `linkmon status` zeigt den erkannten Pi-hole.
-Leitet der Router DNS-Anfragen ins Internet zwangsweise auf den Pi-hole um, ist der Vergleich nicht aussagekräftig.
+**Pi-hole und andere eigene DNS-Server.** Die DNS-Prüfung fragt so, wie dieser Rechner DNS nutzt, also über den Pi-hole,
+falls er eingetragen ist. Scheitert sie, fragt linkmon zum Vergleich einen öffentlichen Server (1.1.1.1, 8.8.8.8) direkt.
+Eine eigene Prüfung des Pi-hole ist standardmäßig aus. Einschalten lässt sie sich mit `dns_home_servers = "auto"` in
+`[reachability]`. Dann erscheint ein nicht antwortender Pi-hole als Ebene „DNS Heimnetz (Pi-hole)“.
 
 Standardmäßig eröffnen 3 fehlerhafte Runden in Folge einen Ausfall, 2 fehlerfreie beenden ihn. Start ist die erste
 fehlerhafte Runde, Ende die erste fehlerfreie. Die Verfügbarkeit zählt nur die Ebene Leitung und bezieht sie auf die
