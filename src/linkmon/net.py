@@ -133,11 +133,41 @@ def split_hops(hops: list[str | None]) -> tuple[list[str], list[str]]:
     return lan, public
 
 
-def check_dns(names: list[str], timeout_s: float) -> ProbeResult:
-    """Fragt den im System eingetragenen DNS-Server direkt, ohne den Cache des Betriebssystems."""
+# So beantworten Pi-hole und andere DNS-Filter gesperrte Namen.
+BLOCKED_ANSWERS = {"0.0.0.0", "::"}
+
+
+def system_nameservers() -> list[str]:
+    """Die im System eingetragenen DNS-Server in ihrer Reihenfolge."""
     try:
-        resolver = dns.resolver.Resolver()
-    except dns.exception.DNSException as exc:
+        return list(dns.resolver.Resolver().nameservers)
+    except dns.exception.DNSException:
+        return []
+
+
+def is_home_dns_server(address: str) -> bool:
+    """Ein DNS-Server im Heimnetz, etwa ein Pi-hole. Nicht der lokale Stub von systemd-resolved."""
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return parsed.version == 4 and parsed.is_private and not parsed.is_loopback
+
+
+def check_dns(names: list[str], timeout_s: float, nameservers: list[str] | None = None) -> ProbeResult:
+    """Löst einen Namen auf, ohne den Cache des Betriebssystems.
+
+    Ohne nameservers gelten die im System eingetragenen Server, samt Ausweichserver. Mit
+    nameservers werden genau diese gefragt, etwa nur der Pi-hole oder nur ein öffentlicher Server.
+    Eine Sperrantwort (0.0.0.0) zählt als Fehler: Dann ist der Name nicht nutzbar.
+    """
+    try:
+        if nameservers is None:
+            resolver = dns.resolver.Resolver()
+        else:
+            resolver = dns.resolver.Resolver(configure=False)
+            resolver.nameservers = list(nameservers)
+    except (dns.exception.DNSException, ValueError) as exc:
         return ProbeResult(False, detail=f"resolver: {type(exc).__name__}")
     resolver.cache = None
     last_error = "keine Namen"
@@ -147,6 +177,9 @@ def check_dns(names: list[str], timeout_s: float) -> ProbeResult:
             answer = resolver.resolve(name, "A", lifetime=per_name_timeout, search=False)
         except dns.exception.DNSException as exc:
             last_error = f"{name}: {type(exc).__name__}"
+            continue
+        if all(item.to_text() in BLOCKED_ANSWERS for item in answer):
+            last_error = f"{name}: gesperrt (DNS-Filter)"
             continue
         latency = answer.response.time * 1000 if answer.response.time else None
         return ProbeResult(True, round(latency, 1) if latency is not None else None)

@@ -22,7 +22,7 @@ import pandas as pd
 
 from linkmon.store import CYCLE_COLUMNS, Store, read_rows
 
-KINDS = ("lan", "isp", "ext", "dns", "https")
+KINDS = ("lan", "isp", "ext", "dns", "dnshome", "dnsref", "https")
 # Frühere Versionen markierten Prüfrunden während eigener Speedtests. Die Leitung war dann
 # ausgelastet: Diese Antwortzeiten zeigen die eigene Last, nicht die Leitung.
 LEGACY_SPEEDTEST_MARKER = "_speedtest"
@@ -162,6 +162,11 @@ def tracks(frame: pd.DataFrame) -> list[Track]:
             result.append(Track(key, f"Heimnetz {key[4:]}", (key,)))
     if "dns" in keys:
         result.append(Track("dns", "DNS-Antwort", ("dns",), is_ping=False))
+    for key in keys:
+        if key.startswith("dnshome:"):
+            result.append(Track(key, f"DNS Heimnetz {key[8:]}", (key,), is_ping=False))
+    if "dnsref" in keys:
+        result.append(Track("dnsref", "DNS öffentlich", ("dnsref",), is_ping=False))
     if "https" in keys:
         result.append(Track("https", "HTTPS-Abruf", ("https",), is_ping=False))
     return result

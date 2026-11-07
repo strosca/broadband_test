@@ -34,6 +34,10 @@ class Reachability:
     isp_hop: str = "auto"
     external_targets: list[str] = field(default_factory=lambda: ["1.1.1.1", "8.8.8.8"])
     dns_names: list[str] = field(default_factory=lambda: ["www.google.com", "www.cloudflare.com"])
+    # DNS-Server im Heimnetz (Pi-hole): "auto" nimmt die privaten Adressen unter den System-DNS-Servern.
+    dns_home_servers: str | list[str] = "auto"
+    # Öffentliche Server zum Vergleich. Leer schaltet den Vergleich ab.
+    dns_reference_servers: list[str] = field(default_factory=lambda: ["1.1.1.1", "8.8.8.8"])
     https_urls: list[str] = field(
         default_factory=lambda: [
             "https://www.google.com/generate_204",
@@ -112,6 +116,10 @@ def _validate(config: Config) -> None:
         raise ConfigError("reachability.dns_names und https_urls dürfen nicht leer sein")
     if not (reach.lan_targets == "auto" or isinstance(reach.lan_targets, list)):
         raise ConfigError('reachability.lan_targets muss "auto" oder eine Liste sein')
+    if not (reach.dns_home_servers == "auto" or isinstance(reach.dns_home_servers, list)):
+        raise ConfigError('reachability.dns_home_servers muss "auto" oder eine Liste sein')
+    if not isinstance(reach.dns_reference_servers, list):
+        raise ConfigError("reachability.dns_reference_servers muss eine Liste sein")
 
 
 def find_config_path(explicit: str | None) -> Path:

@@ -1,4 +1,4 @@
-"""Kommandozeile: linkmon run | dashboard | report | export | status."""
+"""Kommandozeile: linkmon run | dashboard | report | export | clear | status."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import IO
 
-from linkmon import __version__
+from linkmon import __version__, net
 from linkmon.config import Config, ConfigError, find_config_path, load_config
 from linkmon.store import Store
 from linkmon.timeutil import format_local, now_utc, parse_iso, parse_user_time
@@ -57,6 +57,20 @@ class InstanceLock:
         self._handle = handle
         return True
 
+    def release(self) -> None:
+        if self._handle is None:
+            return
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+
+                self._handle.seek(0)
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+        self._handle.close()  # Unter Linux gibt das Schließen die Sperre frei.
+        self._handle = None
+
 
 def _start_web_interface(config: Config) -> None:
     """Startet das Webinterface. Scheitert es, läuft die Messung trotzdem weiter."""
@@ -68,7 +82,9 @@ def _start_web_interface(config: Config) -> None:
         log.exception("Webinterface konnte nicht gestartet werden, die Messung läuft weiter")
         return
     if url:
-        log.info("Webinterface: %s", url)
+        from linkmon.dashboard import listen_urls
+
+        log.info("Webinterface: %s", ", ".join(listen_urls(config.dashboard.host, config.dashboard.port)))
     else:
         log.warning("Webinterface nicht gestartet: Port %d ist belegt. Die Messung läuft weiter.", config.dashboard.port)
 
@@ -104,12 +120,23 @@ def _cmd_run(config: Config, _args: argparse.Namespace) -> int:
 
 
 def _cmd_dashboard(config: Config, args: argparse.Namespace) -> int:
-    from linkmon.dashboard import create_app
+    from linkmon.dashboard import listen_urls, make_web_server
 
     host = args.host or config.dashboard.host
     port = args.port or config.dashboard.port
-    print(f"Dashboard: http://{host}:{port}  (Beenden mit Strg+C)")
-    create_app(config).run(host=host, port=port, debug=False)
+    try:
+        server = make_web_server(config, host, port)
+    except OSError as exc:
+        print(f"Fehler: Port {port} ist belegt oder die Adresse {host} ungültig ({exc}). "
+              "Läuft schon der Messdienst mit Webinterface?", file=sys.stderr)
+        return 2
+    print(f"Webinterface: {', '.join(listen_urls(host, port))}  (Beenden mit Strg+C)")
+    try:
+        server.run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.close()
     return 0
 
 
@@ -163,6 +190,57 @@ def _cmd_export(config: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+CLEAR_WAIT_S = 30
+
+
+def _confirm(question: str) -> bool:
+    try:
+        answer = input(f"{question} [j/N] ")
+    except EOFError:
+        return False
+    return answer.strip().lower() in {"j", "ja", "y", "yes"}
+
+
+def _cmd_clear(config: Config, args: argparse.Namespace) -> int:
+    from linkmon import clearing
+    from linkmon.store import remove_store_dir
+
+    if not Store.exists(config.store_dir):
+        print("Keine Messdaten vorhanden, nichts zu leeren.")
+        return 0
+    store = _open_store(config)
+    print(f"Messdaten: {config.store_dir}")
+    print(f"Prüfrunden: {store.count_cycles()}, Ausfälle: {len(store.outages())}")
+    archive = None if args.delete else clearing.archive_target(config.data_dir, now_utc().astimezone(config.zone))
+    action = "endgültig LÖSCHEN" if archive is None else f"nach {archive} verschieben"
+    if not args.yes and not _confirm(f"Alle Messdaten {action}? Webinterface und Berichte beginnen dann bei null."):
+        print("Abgebrochen, nichts geändert.")
+        return 1
+
+    lock = _lock(config)
+    if lock.acquire():
+        try:
+            remove_store_dir(config.store_dir, archive)
+        finally:
+            lock.release()
+        print("Messdaten " + ("gelöscht." if archive is None else f"archiviert: {archive}"))
+        return 0
+
+    # Der Messdienst läuft: Er leert selbst und misst danach ohne Unterbrechung weiter.
+    clearing.write_request(config.data_dir, archive)
+    print("Der Messdienst läuft und leert die Daten vor der nächsten Prüfrunde ...")
+    result = clearing.wait_for_result(config.data_dir, CLEAR_WAIT_S)
+    if result is None:
+        clearing.request_path(config.data_dir).unlink(missing_ok=True)
+        print(f"Fehler: Der Messdienst hat in {CLEAR_WAIT_S} s nicht reagiert. Nichts geändert.", file=sys.stderr)
+        return 2
+    if not result.ok:
+        print(f"Fehler: {result.message}", file=sys.stderr)
+        return 2
+    print(result.message + ". Die Messung läuft weiter.")
+    return 0
+
+
 def _percent(value: float | None, digits: int) -> str:
     return "-" if value is None else f"{value:.{digits}f} %".replace(".", ",")
 
@@ -178,7 +256,13 @@ def _cmd_status(config: Config, _args: argparse.Namespace) -> int:
     zone = config.zone
     reach = config.reachability
     print(f"Konfiguration: {config.path}")
-    print(f"Webinterface: http://{config.dashboard.host}:{config.dashboard.port} (solange der Messdienst läuft)")
+    from linkmon.dashboard import listen_urls
+
+    print(f"Webinterface: {', '.join(listen_urls(config.dashboard.host, config.dashboard.port))} "
+          "(solange der Messdienst läuft)")
+    home_dns = [host for host in net.system_nameservers() if net.is_home_dns_server(host)]
+    print(f"DNS-Server: {', '.join(net.system_nameservers()) or '-'}"
+          + (f", davon im Heimnetz (Pi-hole): {', '.join(home_dns)}" if home_dns else ""))
     print(f"Prüfung: alle {reach.interval_s:g} s, Ziele {', '.join(reach.external_targets)}, DNS, HTTPS")
     info = collect_host_info()
     print(f"Gerät: {info.hostname}, Interface {info.interface}, {info.connection_type}, {info.link_mbps} Mbit/s")
@@ -230,6 +314,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_range(export)
     export.add_argument("--excel-de", action="store_true", help="CSV für deutsches Excel (Semikolon, Dezimalkomma)")
     export.set_defaults(handler=_cmd_export)
+
+    clear = commands.add_parser("clear", help="Alle Messdaten leeren (archivieren), auch bei laufendem Messdienst")
+    clear.add_argument("--delete", action="store_true", help="Endgültig löschen statt nach data/archiv verschieben")
+    clear.add_argument("--yes", "-y", action="store_true", help="Ohne Rückfrage")
+    clear.set_defaults(handler=_cmd_clear)
 
     commands.add_parser("status", help="Konfiguration und letzten Stand anzeigen").set_defaults(handler=_cmd_status)
     return parser

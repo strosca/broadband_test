@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from linkmon.levels import Level
@@ -11,7 +11,12 @@ from linkmon.levels import Level
 
 @dataclass(frozen=True)
 class CycleStatus:
-    """Ergebnis einer Prüfrunde. isp_hop ist None, wenn kein Hop bekannt ist."""
+    """Ergebnis einer Prüfrunde. isp_hop ist None, wenn kein Hop bekannt ist.
+
+    dns ist die Auflösung wie sie das Gerät erlebt, samt Ausweichserver. dns_home fragt jeden
+    DNS-Server im Heimnetz (Pi-hole) einzeln, dns_reference einen öffentlichen Server direkt.
+    dns_reference ist None, wenn der Vergleich abgeschaltet ist.
+    """
 
     interface_up: bool
     lan: dict[str, bool]
@@ -19,6 +24,8 @@ class CycleStatus:
     external: dict[str, bool]
     dns: bool
     https: bool
+    dns_home: dict[str, bool] = field(default_factory=dict)
+    dns_reference: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -47,11 +54,41 @@ def classify(status: CycleStatus) -> Classification:
             return Classification(Level.LINE, "Erster Provider-Hop und externe Ziele nicht erreichbar")
         return Classification(Level.LINE, "Externe Ziele nicht erreichbar, Router erreichbar")
 
-    if not status.dns:
-        return Classification(Level.DNS, "DNS-Auflösung fehlgeschlagen, externe Ziele erreichbar")
+    dns_result = classify_dns(status)
+    if dns_result is not None:
+        return dns_result
     if not status.https:
         return Classification(Level.HTTPS, "HTTPS fehlgeschlagen, DNS und externe Ziele in Ordnung")
     return Classification(None)
+
+
+def classify_dns(status: CycleStatus) -> Classification | None:
+    """Trennt einen gestörten Pi-hole von einer DNS-Störung beim Anbieter oder im Internet.
+
+    Antwortet der öffentliche Vergleichsserver, funktioniert DNS über die Leitung: Die Ursache liegt
+    im Heimnetz. Ein ausgefallener Pi-hole fällt auch auf, wenn ein Ausweichserver einspringt,
+    denn andere Geräte im Haushalt haben oft nur den Pi-hole eingetragen.
+    """
+    failed_home = [host for host, ok in status.dns_home.items() if not ok]
+    reference = status.dns_reference
+    if not status.dns:
+        if reference is False or (reference is None and not status.dns_home):
+            suffix = ", auch der öffentliche DNS-Server antwortet nicht" if reference is False else ""
+            return Classification(Level.DNS, f"DNS-Auflösung fehlgeschlagen, externe Ziele erreichbar{suffix}")
+        if failed_home:
+            return Classification(Level.DNS_HOME, f"DNS-Server im Heimnetz antwortet nicht: {', '.join(failed_home)}"
+                                  + (", öffentlicher DNS-Server antwortet" if reference else ""))
+        if status.dns_home:
+            return Classification(Level.DNS_HOME, "Namensauflösung auf diesem Gerät gestört, "
+                                                  "die DNS-Server antworten direkt gefragt")
+        return Classification(Level.DNS, "DNS-Server des Anbieters gestört, öffentlicher DNS-Server antwortet")
+    if failed_home:
+        if reference is False:
+            return Classification(Level.DNS, f"DNS-Server im Heimnetz ({', '.join(failed_home)}) und öffentlicher "
+                                             "DNS-Server antworten nicht")
+        return Classification(Level.DNS_HOME, f"DNS-Server im Heimnetz antwortet nicht: {', '.join(failed_home)}. "
+                                              "Dieses Gerät nutzt einen Ausweichserver, andere Geräte evtl. nicht")
+    return None
 
 
 @dataclass(frozen=True)

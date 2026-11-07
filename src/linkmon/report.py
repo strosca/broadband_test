@@ -228,7 +228,9 @@ def _methodology(config: Config, sessions: list[dict[str, Any]], styles: dict[st
         ("Verbindungsart", _connection_text(sessions)),
         ("Messsoftware", f"linkmon {_distinct(sessions, 'linkmon_version')}, Python {_distinct(sessions, 'python_version')}"),
         ("Prüfung", f"alle {reach.interval_s:g} s parallel: je ein Ping an Router im Heimnetz, ersten Provider-Hop und "
-                    f"{', '.join(reach.external_targets)}, dazu eine DNS-Abfrage und ein HTTPS-Abruf"),
+                    f"{', '.join(reach.external_targets)}, dazu eine DNS-Abfrage (System, eigener DNS-Server im "
+                    f"Heimnetz und zum Vergleich {', '.join(reach.dns_reference_servers) or 'kein öffentlicher Server'})"
+                    " und ein HTTPS-Abruf"),
         ("Ausfall-Erkennung", f"{reach.failure_threshold} fehlerhafte Prüfungen in Folge eröffnen, "
                               f"{reach.recovery_threshold} fehlerfreie beenden einen Ausfall. Start ist die erste "
                               "fehlerhafte, Ende die erste fehlerfreie Prüfung."),
@@ -237,7 +239,9 @@ def _methodology(config: Config, sessions: list[dict[str, Any]], styles: dict[st
     method_text = (
         "Die Ebene eines Ausfalls ergibt sich aus der innersten gestörten Prüfung. <b>Leitung</b>: Router erreichbar, "
         "aber alle externen Ziele nicht. <b>Router/LAN</b>: ein Router im Heimnetz antwortet nicht. <b>Lokal</b>: das "
-        "Messgerät hat keine aktive Verbindung. <b>Nur DNS, nur HTTPS</b>: der jeweilige Dienst scheitert, während die "
+        "Messgerät hat keine aktive Verbindung. <b>DNS Heimnetz</b>: der eigene DNS-Server im Heimnetz (Pi-hole) "
+        "antwortet nicht, ein öffentlicher DNS-Server direkt gefragt aber schon. Das ist kein Fehler des Anbieters. "
+        "<b>Nur DNS, nur HTTPS</b>: der jeweilige Dienst scheitert, während die "
         "Grundverbindung steht. Die <b>Verfügbarkeit</b> berücksichtigt nur Leitungsausfälle und bezieht sie auf die "
         "Zeit, in der das Tool tatsächlich geprüft hat. Messlücken zählen weder als verfügbar noch als Ausfall."
     )

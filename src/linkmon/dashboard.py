@@ -47,7 +47,8 @@ COLOR_RAISED = "#232322"
 COLOR_GAP = "#55544f"
 # Kategoriale Reihenfolge: Die Farbe folgt der Strecke (Internet, Provider-Hop, Heimnetz ...), nie dem Rang.
 SERIES_COLORS = ("#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9")
-LEVEL_COLORS_DARK = {"line": "#e66767", "router": "#c98500", "local": "#9085e9", "dns": "#d55181", "https": "#008300"}
+LEVEL_COLORS_DARK = {"line": "#e66767", "router": "#c98500", "local": "#9085e9", "dns_home": "#3fa7d6",
+                     "dns": "#d55181", "https": "#008300"}
 # Blaue Rampe für Mengen: dunkel nahe der Fläche heißt wenig, hell heißt viel.
 SEQUENTIAL_DARK = [[0.0, "#0d366b"], [0.35, "#1c5cab"], [0.7, "#3987e5"], [1.0, "#b7d3f6"]]
 TABLE_OUTAGE_FILL = "#2c1c1b"
@@ -342,7 +343,8 @@ def _range_bounds(choice: str, custom_start: str | None, custom_end: str | None,
     return datetime(2000, 1, 1, tzinfo=UTC), finish
 
 
-CHECK_LABELS = {"lan": "Heimnetz", "isp": "Provider-Hop", "ext": "Internet", "dns": "DNS", "https": "HTTPS",
+CHECK_LABELS = {"lan": "Heimnetz", "isp": "Provider-Hop", "ext": "Internet", "dns": "DNS",
+                "dnshome": "DNS Heimnetz (Pi-hole)", "dnsref": "DNS öffentlich", "https": "HTTPS",
                 "interface": "Netzwerkkarte"}
 
 
@@ -502,18 +504,48 @@ def track_table(stats: list[TrackStats], samples: pd.DataFrame) -> html.Table:
     return html.Table([head, html.Tbody(rows)], className="stats-table")
 
 
+ALL_INTERFACES = {"0.0.0.0", "", "*"}
+WEB_THREADS = 8
+# Adapter von WSL, Hyper-V, Docker und VMs: Andere Geräte im Heimnetz erreichen sie nicht.
+VIRTUAL_ADAPTERS = ("vethernet", "virtualbox", "vmware", "docker", "br-", "veth", "virbr", "loopback")
+
+
+def listen_urls(host: str, port: int) -> list[str]:
+    """Adressen, unter denen das Webinterface erreichbar ist. Bei 0.0.0.0 jede IPv4-Adresse dieses Geräts."""
+    if host not in ALL_INTERFACES:
+        return [f"http://{host}:{port}"]
+    import socket
+
+    import psutil
+
+    addresses = [item.address for name, items in psutil.net_if_addrs().items() for item in items
+                 if item.family == socket.AF_INET and not item.address.startswith(("127.", "169.254."))
+                 and not name.lower().startswith(VIRTUAL_ADAPTERS)]
+    hostname = socket.gethostname()
+    return [f"http://{address}:{port}" for address in sorted(set(addresses))] + [f"http://{hostname}:{port}"]
+
+
+def make_web_server(config: Config, host: str, port: int) -> Any:
+    """Ein richtiger Webserver (waitress) statt des Entwicklungsservers von Flask.
+
+    Er bedient mehrere Geräte gleichzeitig. Ist der Port belegt, wirft er OSError.
+    """
+    from waitress.server import create_server
+
+    logging.getLogger("waitress").setLevel(logging.WARNING)  # Sonst füllt jeder Abruf das Log.
+    app = create_app(config)
+    return create_server(app.server, host="0.0.0.0" if host in ALL_INTERFACES else host, port=port,
+                         threads=WEB_THREADS, ident="linkmon")
+
+
 def start_in_background(config: Config) -> str | None:
     """Startet das Webinterface im Hintergrund. Gibt die Adresse zurück, oder None, wenn der Port belegt ist."""
-    from werkzeug.serving import make_server
-
-    logging.getLogger("werkzeug").setLevel(logging.WARNING)  # Sonst füllen die Abrufe das Log.
-    app = create_app(config)
     host, port = config.dashboard.host, config.dashboard.port
     try:
-        server = make_server(host, port, app.server, threaded=True)
-    except (OSError, SystemExit):  # werkzeug beendet bei belegtem Port sonst den ganzen Prozess.
+        server = make_web_server(config, host, port)
+    except OSError:
         return None
-    threading.Thread(target=server.serve_forever, name="web-interface", daemon=True).start()
+    threading.Thread(target=server.run, name="web-interface", daemon=True).start()
     return f"http://{host}:{port}"
 
 

@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any
 
-from linkmon import __version__, hostinfo, net
+from linkmon import __version__, clearing, hostinfo, net
 from linkmon.classify import (
     Classification,
     CycleStatus,
@@ -96,6 +96,11 @@ class Prober:
             hosts.insert(0, gateway)
         return hosts
 
+    def _dns_home_servers(self) -> list[str]:
+        if self._reach.dns_home_servers != "auto":
+            return list(self._reach.dns_home_servers)
+        return [host for host in net.system_nameservers() if net.is_home_dns_server(host)]
+
     def run_cycle(self) -> CycleResult:
         reach = self._reach
         interface = hostinfo.active_interface()
@@ -114,6 +119,12 @@ class Prober:
         for host in reach.external_targets:
             futures[f"ext:{host}"] = self._pool.submit(net.ping, host, reach.ping_timeout_s)
         futures["dns"] = self._pool.submit(net.check_dns, reach.dns_names, reach.dns_timeout_s)
+        dns_home = self._dns_home_servers()
+        for host in dns_home:
+            futures[f"dnshome:{host}"] = self._pool.submit(net.check_dns, reach.dns_names, reach.dns_timeout_s, [host])
+        if reach.dns_reference_servers:
+            futures["dnsref"] = self._pool.submit(net.check_dns, reach.dns_names, reach.dns_timeout_s,
+                                                  reach.dns_reference_servers)
         futures["https"] = self._pool.submit(net.check_https, reach.https_urls, reach.https_timeout_s)
 
         budget = max(reach.ping_timeout_s, reach.dns_timeout_s, reach.https_timeout_s) + 1.5
@@ -136,6 +147,8 @@ class Prober:
             external={host: probes[f"ext:{host}"].ok for host in reach.external_targets},
             dns=probes["dns"].ok,
             https=probes["https"].ok,
+            dns_home={host: probes[f"dnshome:{host}"].ok for host in dns_home},
+            dns_reference=probes["dnsref"].ok if "dnsref" in probes else None,
         )
         results = {name: [int(p.ok), p.latency_ms, p.detail] for name, p in probes.items()}
         results["interface"] = [int(interface_up), None, interface or ""]
@@ -170,6 +183,7 @@ class Monitor:
         self._last_route_refresh: datetime | None = None
         self._route_thread: threading.Thread | None = None
         self._interface: str | None = None
+        self._info: HostInfo | None = None
         self._connection_thread: threading.Thread | None = None
 
     def stop(self) -> None:
@@ -184,18 +198,7 @@ class Monitor:
         recovered = self._db.recover_after_crash(now)
         if recovered:
             log.warning("%d offene Ausfälle nach unsauberem Ende als unbestätigt geschlossen", recovered)
-        info = self._host_info()
-        self._session_id = self._db.start_session(
-            now, info.hostname, info.os_name, platform.python_version(), __version__, self._config.sha256,
-            interface=info.interface, connection_type=info.connection_type, link_mbps=info.link_mbps,
-        )
-        self._interface = info.interface
-        self._remember_connection(info)
-        log.info("Sitzung %d gestartet auf %s, Interface %s (%s, %s Mbit/s)", self._session_id, info.hostname,
-                 info.interface, info.connection_type, info.link_mbps)
-        for warning in hostinfo.measurement_warnings(info):
-            log.warning(warning)
-            self._db.add_event(self._session_id, now, "warnung", warning)
+        self._start_session(now, self._host_info())
 
         reason = "regulär beendet"
         try:
@@ -210,6 +213,43 @@ class Monitor:
             self._apply(self._tracker.interrupt(end))
             self._db.end_session(self._session_id, end, reason)
             log.info("Sitzung %d beendet: %s", self._session_id, reason)
+
+    def _start_session(self, now: datetime, info: HostInfo) -> None:
+        self._session_id = self._db.start_session(
+            now, info.hostname, info.os_name, platform.python_version(), __version__, self._config.sha256,
+            interface=info.interface, connection_type=info.connection_type, link_mbps=info.link_mbps,
+        )
+        self._info = info
+        self._interface = info.interface
+        self._remember_connection(info)
+        log.info("Sitzung %d gestartet auf %s, Interface %s (%s, %s Mbit/s)", self._session_id, info.hostname,
+                 info.interface, info.connection_type, info.link_mbps)
+        for warning in hostinfo.measurement_warnings(info):
+            log.warning(warning)
+            self._db.add_event(self._session_id, now, "warnung", warning)
+
+    def _handle_clear_request(self) -> None:
+        """Leert die Messdaten, wenn `linkmon clear` darum gebeten hat. Die Messung läuft danach weiter."""
+        data_dir = self._config.data_dir
+        found, archive = clearing.take_request(data_dir)
+        if not found:
+            return
+        now = self._clock()
+        end = self._last_cycle or now
+        self._apply(self._tracker.interrupt(end))
+        self._db.end_session(self._session_id, end, "Messdaten geleert")
+        try:
+            self._db.reset(archive)
+        except OSError as exc:
+            log.error("Messdaten konnten nicht geleert werden: %s", exc)
+            result = clearing.ClearResult(False, message=f"{type(exc).__name__}: {exc}. Ist eine Datei in Excel offen?")
+        else:
+            self._last_cycle = None
+            where = f"archiviert nach {archive}" if archive else "gelöscht"
+            log.warning("Messdaten geleert und %s", where)
+            result = clearing.ClearResult(True, archive, f"Messdaten {where}")
+        self._start_session(now, self._info if self._info is not None else self._host_info())
+        clearing.write_result(data_dir, result)
 
     def _remember_connection(self, info: HostInfo) -> None:
         self._db.set_meta(META_CONNECTION, json.dumps(asdict(info), ensure_ascii=False))
@@ -252,6 +292,7 @@ class Monitor:
     def _update_connection(self, previous: str | None) -> None:
         try:
             info = self._host_info()
+            self._info = info
             self._remember_connection(info)
             kind = CONNECTION_LABELS.get(info.connection_type, info.connection_type)
             message = f"Verbindung gewechselt: {previous or '-'} auf {info.interface} ({kind})"
@@ -263,6 +304,10 @@ class Monitor:
     def _reachability_loop(self) -> None:
         interval = self._config.reachability.interval_s
         while not self._stop.is_set():
+            try:
+                self._handle_clear_request()
+            except Exception:
+                log.exception("Auftrag zum Leeren der Messdaten fehlgeschlagen")
             started = self._clock()
             self._check_gap(started)
             try:

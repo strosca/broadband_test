@@ -19,7 +19,9 @@ import io
 import json
 import logging
 import os
+import shutil
 import threading
+import time
 from collections.abc import Iterable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -152,6 +154,37 @@ def _bounds(start: datetime | None, end: datetime | None) -> tuple[str | None, s
     return (iso_utc(start) if start else None, iso_utc(end) if end else None)
 
 
+def _rename_with_retry(source: Path, target: Path, attempts: int = 10) -> None:
+    """Unter Windows blockiert eine gerade lesende Webseite das Umbenennen kurz: dann erneut versuchen."""
+    for attempt in range(attempts):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.5)
+
+
+def remove_store_dir(directory: Path, archive_to: Path | None) -> None:
+    """Verschiebt den Ordner der Messdaten ins Archiv oder löscht ihn, wenn archive_to None ist.
+
+    Gelöscht wird erst nach dem Umbenennen: Scheitert es, bleibt der Ordner vollständig erhalten
+    und nicht halb gelöscht. Gelingt nur das Löschen danach nicht, liegt ein Rest neben dem Ordner.
+    """
+    if not directory.exists():
+        return
+    if archive_to is not None:
+        archive_to.parent.mkdir(parents=True, exist_ok=True)
+        _rename_with_retry(directory, archive_to)
+        return
+    trash = directory.with_name(f".{directory.name}-geloescht-{time.time_ns()}")
+    _rename_with_retry(directory, trash)
+    shutil.rmtree(trash, ignore_errors=True)
+    if trash.exists():
+        log.warning("Gelöschte Messdaten konnten nicht vollständig entfernt werden: %s", trash)
+
+
 class _Appender:
     """Hängt Zeilen an eine Datei an. Ist sie gesperrt, bleiben sie bis zum nächsten Versuch im Speicher."""
 
@@ -203,6 +236,10 @@ class Store:
             if not self.exists(directory):
                 raise FileNotFoundError(f"Keine Messdaten gefunden: {directory}")
             return
+        self._load()
+
+    def _load(self) -> None:
+        directory = self.directory
         directory.mkdir(parents=True, exist_ok=True)
         self._sessions = read_rows(directory / SESSIONS_FILE, SESSION_COLUMNS)
         self._outages = read_rows(directory / OUTAGES_FILE, OUTAGE_COLUMNS)
@@ -365,6 +402,22 @@ class Store:
             if outages:
                 self._save(OUTAGES_FILE)
             return len(outages)
+
+    def reset(self, archive_to: Path | None) -> None:
+        """Leert die Messdaten im laufenden Betrieb: archiviert oder löscht den Ordner und beginnt neu.
+
+        Die internen Merkwerte (Route, Verbindung) bleiben erhalten, sie sind keine Messdaten.
+        Scheitert das Verschieben, bleibt alles wie es war.
+        """
+        self._require_writable()
+        with self._lock:
+            self._flush_pending()
+            meta = dict(self._meta)
+            remove_store_dir(self.directory, archive_to)
+            self._load()
+            self._meta = meta
+            if meta:
+                self._rewrite(META_FILE)
 
     # Lesen -------------------------------------------------------------------------------------
 

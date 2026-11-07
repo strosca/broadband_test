@@ -33,7 +33,9 @@ Das legt `.venv` und eine `config.toml` an. In einer aktivierten `.venv` heißt 
 linkmon run
 ```
 
-Das startet die Messung und das Webinterface. Dann jederzeit im Browser reinschauen: **http://127.0.0.1:8050**
+Das startet die Messung und das Webinterface. Dann jederzeit im Browser reinschauen, auf diesem Rechner unter
+**http://127.0.0.1:8050**, von Handy, Tablet oder anderem PC im Heimnetz unter `http://RECHNERNAME:8050` oder
+`http://IP-ADRESSE:8050`. Die Adressen stehen beim Start im Log und in `linkmon status`.
 
 ## Vor der Messung
 
@@ -60,11 +62,24 @@ powershell -ExecutionPolicy Bypass -File deploy\windows\install.ps1 -UnregisterT
 
 Linux: `./deploy/linux/install.sh --enable` installiert und startet den systemd-Dienst `linkmon`.
 
-Zum Ausprobieren im Vordergrund: `linkmon run`, Beenden mit Strg+C. Das Webinterface läuft so lange wie der Dienst und
-ist nur von diesem Rechner aus erreichbar. Es kann immer nur ein Messdienst je Datenordner laufen. Das Log liegt
+Zum Ausprobieren im Vordergrund: `linkmon run`, Beenden mit Strg+C. Das Webinterface läuft so lange wie der Dienst.
+Es kann immer nur ein Messdienst je Datenordner laufen. Das Log liegt
 rotierend in `data/logs/linkmon.log`.
 
 ## Webinterface
+
+Das Webinterface läuft auf einem richtigen Webserver (waitress), der mehrere Geräte gleichzeitig bedient. Mit
+`host = "0.0.0.0"` in `[dashboard]` ist es im ganzen Heimnetz erreichbar, mit `"127.0.0.1"` nur auf diesem Rechner. Es
+gibt kein Passwort: Jeder im Heimnetz kann die Messwerte sehen, aber nichts ändern.
+
+**Windows-Firewall:** Ohne Freigabe blockiert Windows die anderen Geräte. `-RegisterTask` legt die Regel mit an, einzeln
+geht es so (als Administrator):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File deploy\windows\install.ps1 -OpenFirewall
+```
+
+Die Regel gilt nur, wenn das Netzwerk in Windows als „Privat“ eingestuft ist, das Skript weist sonst darauf hin.
 
 | Bereich | Inhalt |
 |---|---|
@@ -80,6 +95,18 @@ das Problem hinter deinem Router. Steigen sie schon im Heimnetz, eher beim WLAN 
 Provider-Hop sind kein Beleg: Router beantworten Pings an sich selbst oft nachrangig.
 
 `linkmon dashboard` startet das Webinterface ohne Messung, etwa um alte Daten anzusehen.
+
+## Messdaten leeren
+
+```powershell
+linkmon clear            # verschiebt alle Messdaten nach data/archiv/messdaten_JJJJMMTT_HHMMSS
+linkmon clear --delete   # löscht sie endgültig
+```
+
+Danach beginnen Webinterface, Plots, Kennzahlen und Berichte bei null. Der Befehl fragt vorher nach (`--yes` überspringt
+das). Der Messdienst muss dafür **nicht** angehalten werden: Läuft er, leert er die Daten selbst vor der nächsten
+Prüfrunde und misst ohne Lücke weiter. Erhalten bleiben die ermittelte Route, die Konfiguration und das Textlog unter
+`data/logs`. Archivierte Daten lassen sich ansehen, indem man den Ordner zurück nach `data/messdaten` verschiebt.
 
 ## Auswerten
 
@@ -123,8 +150,18 @@ dazu eine DNS-Abfrage und einen HTTPS-Abruf. Maßgeblich für einen Ausfall ist 
 | Lokal | Messgerät ohne aktive Verbindung oder Standardroute |
 | Router/LAN | Ein Router im Heimnetz antwortet nicht. Bei zwei Routern steht der betroffene im Befund |
 | Leitung | Router erreichbar, aber **alle** externen Ziele nicht |
-| Nur DNS | Externe Ziele erreichbar, DNS scheitert |
+| DNS Heimnetz (Pi-hole) | Der eigene DNS-Server im Heimnetz antwortet nicht, ein öffentlicher DNS-Server direkt gefragt schon |
+| Nur DNS | Externe Ziele erreichbar, DNS scheitert auch beim öffentlichen Server, oder der DNS des Anbieters ist gestört |
 | Nur HTTPS | DNS und externe Ziele in Ordnung, HTTPS scheitert |
+
+**Pi-hole und andere eigene DNS-Server.** Ein Pi-hole ist ein Gerät im Heimnetz. Fällt er aus, scheitert DNS, obwohl
+die Leitung in Ordnung ist. Damit das nicht dem Anbieter angelastet wird, fragt jede Runde drei Wege ab: DNS so, wie es
+dieses Gerät nutzt, jeden privaten DNS-Server aus der Systemeinstellung (den Pi-hole) einzeln und einen öffentlichen
+Server (1.1.1.1, 8.8.8.8) direkt. Antwortet der öffentliche, liegt die Störung im Heimnetz. Ein ausgefallener Pi-hole fällt
+auch auf, wenn dieser Rechner unbemerkt auf einen Ausweich-DNS wie 1.1.1.1 umschaltet: Andere Geräte haben oft nur den
+Pi-hole eingetragen. Eine Sperrantwort des Pi-hole (`0.0.0.0`) für die Testnamen zählt als Fehler. Eingestellt wird das
+mit `dns_home_servers` und `dns_reference_servers` in `[reachability]`, `linkmon status` zeigt den erkannten Pi-hole.
+Leitet der Router DNS-Anfragen ins Internet zwangsweise auf den Pi-hole um, ist der Vergleich nicht aussagekräftig.
 
 Standardmäßig eröffnen 3 fehlerhafte Runden in Folge einen Ausfall, 2 fehlerfreie beenden ihn. Start ist die erste
 fehlerhafte Runde, Ende die erste fehlerfreie. Die Verfügbarkeit zählt nur die Ebene Leitung und bezieht sie auf die
@@ -159,5 +196,5 @@ unbestätigt markiert.
 ```
 
 Aufbau unter `src/linkmon`: `classify` (Einordnung, ohne Netzzugriff), `net` und `hostinfo` (Prüfungen, Metadaten),
-`monitor` (Dienst), `store` (CSV-Speicher), `quality` (Ping, Verlust, Jitter je Strecke), `stats` (Ausfälle,
+`monitor` (Dienst), `store` (CSV-Speicher), `clearing` (Messdaten leeren), `quality` (Ping, Verlust, Jitter je Strecke), `stats` (Ausfälle,
 Verfügbarkeit), `plots`, `report`, `export`, `dashboard`, `cli`.
