@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -74,6 +75,44 @@ def test_line_outage_still_wins_over_dns() -> None:
 ])
 def test_home_dns_server_detection(address: str, home: bool) -> None:
     assert net.is_home_dns_server(address) is home
+
+
+# Windows meldet auch die DNS-Server des getrennten WLANs, hier den Pi-hole am Deco.
+STALE_WLAN_ORDER = [PIHOLE, "1.1.1.1", "192.168.0.1"]
+CABLE_AT_STATION = [ipaddress.ip_network("192.168.0.0/24"), ipaddress.ip_network("127.0.0.0/8")]
+WLAN_AT_DECO = [ipaddress.ip_network("192.168.68.0/24"), ipaddress.ip_network("127.0.0.0/8")]
+
+
+def test_unreachable_pihole_of_disconnected_wlan_is_skipped() -> None:
+    assert net.usable_nameservers(STALE_WLAN_ORDER, CABLE_AT_STATION) == ["1.1.1.1", "192.168.0.1"]
+
+
+def test_pihole_is_kept_when_in_connected_network() -> None:
+    assert net.usable_nameservers(STALE_WLAN_ORDER, WLAN_AT_DECO) == [PIHOLE, "1.1.1.1"]
+
+
+def test_local_stub_and_fallback_when_nothing_matches() -> None:
+    assert net.usable_nameservers(["127.0.0.53"], CABLE_AT_STATION) == ["127.0.0.53"]
+    assert net.usable_nameservers([PIHOLE], CABLE_AT_STATION) == [PIHOLE]
+
+
+def test_monitor_does_not_probe_unreachable_pihole(config: Config, store: Store,
+                                                   monkeypatch: pytest.MonkeyPatch) -> None:
+    from dataclasses import replace
+
+    from linkmon.monitor import Prober
+    from linkmon.net import ProbeResult
+
+    _fake_network(monkeypatch, STATION, {STATION, "1.1.1.1", "8.8.8.8"})
+    monkeypatch.setattr(net, "configured_nameservers", lambda: list(STALE_WLAN_ORDER))
+    monkeypatch.setattr(net, "connected_networks", lambda: list(CABLE_AT_STATION))
+    asked: list[list[str] | None] = []
+    monkeypatch.setattr(net, "check_dns", lambda _n, _t, servers=None: asked.append(servers) or ProbeResult(True, 5.0))
+    config = replace(config, reachability=replace(config.reachability, dns_home_servers="auto"))
+    result = Prober(config, store).run_cycle()
+    assert all(servers is None or PIHOLE not in servers for servers in asked)
+    assert list(result.status.dns_home) == ["192.168.0.1"]
+    assert ["1.1.1.1", "192.168.0.1"] in asked
 
 
 def test_blocked_answer_counts_as_failure(monkeypatch: pytest.MonkeyPatch) -> None:

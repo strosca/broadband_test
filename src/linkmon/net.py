@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -14,6 +15,7 @@ from typing import Any
 
 import dns.exception
 import dns.resolver
+import psutil
 
 from linkmon import __version__
 
@@ -137,12 +139,66 @@ def split_hops(hops: list[str | None]) -> tuple[list[str], list[str]]:
 BLOCKED_ANSWERS = {"0.0.0.0", "::"}
 
 
-def system_nameservers() -> list[str]:
-    """Die im System eingetragenen DNS-Server in ihrer Reihenfolge."""
+def configured_nameservers() -> list[str]:
+    """Alle im System eingetragenen DNS-Server, auch die von getrennten Adaptern.
+
+    Unter Windows liest dnspython die Einträge aller Adapter aus der Registry. Ein getrenntes
+    WLAN behält dort seinen Pi-hole, obwohl er über das Kabel nicht erreichbar ist.
+    """
     try:
         return list(dns.resolver.Resolver().nameservers)
     except dns.exception.DNSException:
         return []
+
+
+def connected_networks() -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+    """Die Subnetze aller Adapter, die gerade verbunden sind."""
+    try:
+        stats = psutil.net_if_stats()
+        addresses = psutil.net_if_addrs()
+    except OSError:
+        return []
+    networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    for name, entries in addresses.items():
+        if not (stats.get(name) and stats[name].isup):
+            continue
+        for entry in entries:
+            if entry.family not in (socket.AF_INET, socket.AF_INET6) or not entry.netmask:
+                continue
+            try:
+                address = entry.address.split("%", 1)[0]
+                networks.append(ipaddress.ip_interface(f"{address}/{entry.netmask}").network)
+            except ValueError:
+                continue
+    return networks
+
+
+def usable_nameservers(servers: list[str],
+                       networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network]) -> list[str]:
+    """Lässt DNS-Server im Heimnetz weg, die in keinem verbundenen Subnetz liegen.
+
+    Beispiel: Der Pi-hole hängt am Deco (192.168.68.x), der Rechner per Kabel an der Vodafone
+    Station (192.168.0.x). Dann ist der Pi-hole nicht erreichbar und nur ein Überbleibsel des
+    getrennten WLANs. Öffentliche Server und der lokale Stub (127.0.0.53) bleiben. Bleibt nichts
+    übrig, gilt die ursprüngliche Liste, damit die Prüfung nicht ins Leere geht.
+    """
+    usable = []
+    for server in servers:
+        try:
+            parsed = ipaddress.ip_address(server.split("%", 1)[0])
+        except ValueError:
+            usable.append(server)
+            continue
+        if parsed.is_global or parsed.is_loopback:
+            usable.append(server)
+        elif any(parsed.version == network.version and parsed in network for network in networks):
+            usable.append(server)
+    return usable or list(servers)
+
+
+def system_nameservers() -> list[str]:
+    """Die DNS-Server, die das System über die verbundenen Adapter tatsächlich erreicht."""
+    return usable_nameservers(configured_nameservers(), connected_networks())
 
 
 def is_home_dns_server(address: str) -> bool:
@@ -157,13 +213,14 @@ def is_home_dns_server(address: str) -> bool:
 def check_dns(names: list[str], timeout_s: float, nameservers: list[str] | None = None) -> ProbeResult:
     """Löst einen Namen auf, ohne den Cache des Betriebssystems.
 
-    Ohne nameservers gelten die im System eingetragenen Server, samt Ausweichserver. Mit
-    nameservers werden genau diese gefragt, etwa nur der Pi-hole oder nur ein öffentlicher Server.
-    Eine Sperrantwort (0.0.0.0) zählt als Fehler: Dann ist der Name nicht nutzbar.
+    Ohne nameservers gelten die erreichbaren Server des Systems (system_nameservers), samt
+    Ausweichserver. Mit nameservers werden genau diese gefragt, etwa nur der Pi-hole oder nur ein
+    öffentlicher Server. Eine Sperrantwort (0.0.0.0) zählt als Fehler: Dann ist der Name nicht nutzbar.
     """
     try:
         if nameservers is None:
             resolver = dns.resolver.Resolver()
+            resolver.nameservers = usable_nameservers(list(resolver.nameservers), connected_networks())
         else:
             resolver = dns.resolver.Resolver(configure=False)
             resolver.nameservers = list(nameservers)

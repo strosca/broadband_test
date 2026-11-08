@@ -161,6 +161,11 @@ falls er eingetragen ist. Scheitert sie, fragt linkmon zum Vergleich einen öffe
 Eine eigene Prüfung des Pi-hole ist standardmäßig aus. Einschalten lässt sie sich mit `dns_home_servers = "auto"` in
 `[reachability]`. Dann erscheint ein nicht antwortender Pi-hole als Ebene „DNS Heimnetz (Pi-hole)“.
 
+Windows behält die DNS-Server getrennter Adapter. Hängt der Pi-hole etwa am Deco (192.168.68.x) und der Rechner per
+Kabel an der Vodafone Station (192.168.0.x), steht der Pi-hole vom WLAN noch in der Liste, ist aber nicht erreichbar.
+linkmon nutzt deshalb private DNS-Server nur, wenn sie in einem Subnetz eines verbundenen Adapters liegen. Welche
+Server gerade gelten, steht bei jedem Wechsel im Log („DNS-Server: …“) und in `linkmon status`.
+
 Standardmäßig eröffnen 3 fehlerhafte Runden in Folge einen Ausfall, 2 fehlerfreie beenden ihn. Start ist die erste
 fehlerhafte Runde, Ende die erste fehlerfreie. Die Verfügbarkeit zählt nur die Ebene Leitung und bezieht sie auf die
 tatsächlich überwachte Zeit.

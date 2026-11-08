@@ -59,6 +59,7 @@ class Prober:
             self._isp_hop = store.get_meta(META_ISP_HOP)
         self._checked_gateway: str | None = None
         self._route_stale = False
+        self._dns_servers: list[str] | None = None
 
     @property
     def route_stale(self) -> bool:
@@ -125,10 +126,20 @@ class Prober:
             hosts.insert(0, gateway)
         return hosts
 
-    def _dns_home_servers(self) -> list[str]:
+    def _system_dns_servers(self) -> list[str]:
+        """Die erreichbaren DNS-Server des Systems. Meldet einen Wechsel, etwa vom WLAN ans Kabel."""
+        servers = net.system_nameservers()
+        with self._lock:
+            changed = servers != self._dns_servers
+            self._dns_servers = servers
+        if changed:
+            log.info("DNS-Server: %s", ", ".join(servers) or "-")
+        return servers
+
+    def _dns_home_servers(self, system_servers: list[str]) -> list[str]:
         if self._reach.dns_home_servers != "auto":
             return list(self._reach.dns_home_servers)
-        return [host for host in net.system_nameservers() if net.is_home_dns_server(host)]
+        return [host for host in system_servers if net.is_home_dns_server(host)]
 
     def run_cycle(self) -> CycleResult:
         reach = self._reach
@@ -148,8 +159,9 @@ class Prober:
             futures[f"isp:{isp_hop}"] = self._pool.submit(net.ping, isp_hop, reach.ping_timeout_s)
         for host in reach.external_targets:
             futures[f"ext:{host}"] = self._pool.submit(net.ping, host, reach.ping_timeout_s)
-        futures["dns"] = self._pool.submit(net.check_dns, reach.dns_names, reach.dns_timeout_s)
-        dns_home = self._dns_home_servers()
+        system_dns = self._system_dns_servers()
+        futures["dns"] = self._pool.submit(net.check_dns, reach.dns_names, reach.dns_timeout_s, system_dns or None)
+        dns_home = self._dns_home_servers(system_dns)
         for host in dns_home:
             futures[f"dnshome:{host}"] = self._pool.submit(net.check_dns, reach.dns_names, reach.dns_timeout_s, [host])
         if reach.dns_reference_servers:
