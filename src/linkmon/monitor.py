@@ -57,6 +57,33 @@ class Prober:
         self._isp_hop: str | None = None if self._reach.isp_hop == "auto" else self._reach.isp_hop
         if self._isp_hop is None:
             self._isp_hop = store.get_meta(META_ISP_HOP)
+        self._checked_gateway: str | None = None
+        self._route_stale = False
+
+    @property
+    def route_stale(self) -> bool:
+        """Die gemerkte Route passt nicht zum aktuellen Netz und muss sofort neu ermittelt werden."""
+        with self._lock:
+            return self._route_stale
+
+    def _check_gateway(self, gateway: str | None) -> None:
+        """Bemerkt einen Wechsel des Netzes, etwa vom Deco direkt an die Vodafone Station.
+
+        Der erste Router der Route ist immer das Standardgateway. Passt er nicht mehr, gehören die
+        gemerkten Router zu einem anderen Netz: Sie wären nicht erreichbar und erschienen als
+        Ausfall im Heimnetz. Bis zur neuen Route wird nur das Gateway selbst geprüft.
+        """
+        if gateway is None or self._reach.lan_targets != "auto":
+            return
+        with self._lock:
+            if gateway == self._checked_gateway:
+                return
+            self._checked_gateway = gateway
+            if self._route_lan and self._route_lan[0] != gateway:
+                log.info("Netz gewechselt (Gateway %s statt %s), Route wird neu ermittelt", gateway,
+                         self._route_lan[0])
+                self._route_lan = []
+                self._route_stale = True
 
     def targets_text(self) -> str:
         with self._lock:
@@ -66,6 +93,8 @@ class Prober:
         """Ermittelt Router und ersten Provider-Hop neu. Gibt True zurück, wenn sich etwas änderte."""
         hops = net.traceroute(self._reach.external_targets[0])
         lan, public = net.split_hops(hops)
+        with self._lock:
+            self._route_stale = False
         if not lan and not public:
             log.warning("Traceroute lieferte keine verwertbaren Hops, behalte bisherige Ziele")
             return False
@@ -106,6 +135,7 @@ class Prober:
         interface = hostinfo.active_interface()
         gateway = net.default_gateway()
         interface_up = hostinfo.interface_is_up(interface) and gateway is not None
+        self._check_gateway(gateway)
 
         lan_hosts = self._lan_targets(gateway)
         with self._lock:
@@ -163,6 +193,7 @@ class Monitor:
     def __init__(self, config: Config, store: Store, *,
                  probe_runner: ProbeRunner | None = None,
                  route_refresher: Callable[[], bool] | None = None,
+                 route_stale: Callable[[], bool] | None = None,
                  host_info: HostInfoCollector = hostinfo.collect_host_info,
                  clock: Callable[[], datetime] = now_utc) -> None:
         self._config = config
@@ -174,8 +205,10 @@ class Monitor:
             prober = Prober(config, store)
             probe_runner = prober.run_cycle
             route_refresher = prober.refresh_route
+            route_stale = lambda: prober.route_stale  # noqa: E731
         self._probe_runner = probe_runner
         self._route_refresher = route_refresher
+        self._route_stale: Callable[[], bool] = route_stale or (lambda: False)
         reach = config.reachability
         self._tracker = OutageTracker(reach.failure_threshold, reach.recovery_threshold)
         self._session_id = 0
@@ -255,10 +288,12 @@ class Monitor:
         self._db.set_meta(META_CONNECTION, json.dumps(asdict(info), ensure_ascii=False))
 
     def _maybe_refresh_route(self, now: datetime, healthy: bool) -> None:
-        if self._route_refresher is None or not healthy:
+        # Nach einem Netzwechsel sofort, auch während einer Störung: Die alte Route verursacht sie oft selbst.
+        stale = self._route_stale()
+        if self._route_refresher is None or not (healthy or stale):
             return
         running = self._route_thread is not None and self._route_thread.is_alive()
-        due = (self._last_route_refresh is None
+        due = (stale or self._last_route_refresh is None
                or (now - self._last_route_refresh).total_seconds() >= ROUTE_REFRESH_S)
         if running or not due:
             return

@@ -176,3 +176,64 @@ def test_web_server_listens_on_all_interfaces(tmp_path: Path) -> None:
     with urllib.request.urlopen(f"http://127.0.0.1:{port}", timeout=10) as response:
         assert response.status == 200
         assert "waitress" in response.headers.get("Server", "") or response.headers.get("Server") == "linkmon"
+
+
+# Netzwechsel: Deco -> direkt an der Vodafone Station ---------------------------------------------
+
+DECO = "192.168.68.1"
+STATION = "192.168.0.1"
+
+
+def _fake_network(monkeypatch: pytest.MonkeyPatch, gateway: str, reachable: set[str]) -> None:
+    from linkmon import hostinfo
+    from linkmon.net import ProbeResult
+
+    monkeypatch.setattr(hostinfo, "active_interface", lambda: "Ethernet")
+    monkeypatch.setattr(hostinfo, "interface_is_up", lambda _name: True)
+    monkeypatch.setattr(net, "default_gateway", lambda: gateway)
+    monkeypatch.setattr(net, "ping", lambda host, _t: ProbeResult(host in reachable, 2.0 if host in reachable else None))
+    monkeypatch.setattr(net, "check_dns", lambda *_a, **_k: ProbeResult(True, 5.0))
+    monkeypatch.setattr(net, "check_https", lambda *_a, **_k: ProbeResult(True, 50.0))
+
+
+def test_old_route_is_dropped_when_plugged_into_the_modem(config: Config, store: Store,
+                                                          monkeypatch: pytest.MonkeyPatch) -> None:
+    import json
+
+    from linkmon.monitor import META_LAN_HOPS, Prober
+
+    store.set_meta(META_LAN_HOPS, json.dumps([DECO, STATION]))
+    _fake_network(monkeypatch, STATION, {STATION, "1.1.1.1", "8.8.8.8", "92.79.214.24"})
+    prober = Prober(config, store)
+    result = prober.run_cycle()
+    assert result.status.lan == {STATION: True}  # Der Deco liegt nicht mehr auf dem Weg.
+    assert classify(result.status).level is None
+    assert prober.route_stale
+
+    monkeypatch.setattr(net, "traceroute", lambda _target: [STATION, None, "92.79.214.24"])
+    prober.refresh_route()
+    assert not prober.route_stale
+    assert json.loads(store.get_meta(META_LAN_HOPS)) == [STATION]
+
+
+def test_same_network_keeps_both_routers(config: Config, store: Store, monkeypatch: pytest.MonkeyPatch) -> None:
+    import json
+
+    from linkmon.monitor import META_LAN_HOPS, Prober
+
+    store.set_meta(META_LAN_HOPS, json.dumps([DECO, STATION]))
+    _fake_network(monkeypatch, DECO, {DECO, STATION, "1.1.1.1", "8.8.8.8"})
+    prober = Prober(config, store)
+    assert prober.run_cycle().status.lan == {DECO: True, STATION: True}
+    assert not prober.route_stale
+
+
+def test_stale_route_is_refreshed_even_during_a_fault(config: Config, store: Store) -> None:
+    from linkmon.monitor import Monitor
+
+    calls: list[int] = []
+    monitor = Monitor(config, store, probe_runner=lambda: None, route_refresher=lambda: calls.append(1) or True,
+                      route_stale=lambda: True, host_info=lambda: None, clock=Clock())
+    monitor._maybe_refresh_route(utc(2026, 11, 1, 12), healthy=False)
+    monitor._route_thread.join(5)
+    assert calls == [1]

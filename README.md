@@ -42,6 +42,8 @@ Das startet die Messung und das Webinterface. Dann jederzeit im Browser reinscha
 1. **Messgerät per Kabel anschließen**, am besten direkt an den Router des Anbieters. Über WLAN erscheinen Aussetzer des
    WLANs als Störung im Heimnetz, und Funkstörungen erhöhen Ping und Verlust. WLAN wird erkannt, im Webinterface
    angezeigt und im Bericht vermerkt. Ein Wechsel der Verbindung fällt auch ohne Neustart auf.
+   Auch ein Wechsel des Anschlusspunkts, etwa vom Mesh-Router direkt an die Vodafone Station, wird am geänderten
+   Gateway erkannt: linkmon verwirft dann die gemerkten Router und ermittelt die Route sofort neu.
 2. **Ruhezustand abschalten.** Im Standby misst nichts, und die Zeit erscheint als Messlücke.
    ```powershell
    powercfg /change standby-timeout-ac 0
