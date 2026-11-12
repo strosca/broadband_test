@@ -35,7 +35,8 @@ def test_changed_data_changes_checksum(seeded: tuple[Store, datetime, datetime],
     first = export_range(store, start, end, tmp_path / "a")
     path = sorted((store.directory / CYCLES_DIR).glob("*.csv"))[0]
     text = path.read_text(encoding="utf-8-sig")
-    path.write_text(text.replace("[1,20.0,", "[1,21.0,", 1), encoding="utf-8-sig")  # Jemand ändert einen Wert.
+    assert ",20,22," in text
+    path.write_text(text.replace(",20,22,", ",21,22,", 1), encoding="utf-8-sig")  # Jemand ändert einen Wert.
     assert export_range(store, start, end, tmp_path / "b").raw_sha256 != first.raw_sha256
 
 

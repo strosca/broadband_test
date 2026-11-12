@@ -6,6 +6,8 @@ Antwortzeit (Median, P95, Maximum) und der Anteil unbeantworteter Pings.
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import math
 import threading
@@ -20,7 +22,8 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-from linkmon.store import CYCLE_COLUMNS, Store, read_rows
+from linkmon import cyclefile
+from linkmon.store import Store, parse_cycle_text
 
 KINDS = ("lan", "isp", "ext", "dns", "dnshome", "dnsref", "https")
 # Frühere Versionen markierten Prüfrunden während eigener Speedtests. Die Leitung war dann
@@ -97,44 +100,144 @@ def parse_cycles(rows: Iterable[dict[str, Any]]) -> pd.DataFrame:
     return pd.DataFrame(data)
 
 
-class SampleCache:
-    """Behält gelesene Tagesdateien im Speicher. Neu gelesen wird nur, was sich geändert hat."""
+def compact_frame(text: str, header: list[str]) -> pd.DataFrame:
+    """Liest Zeilen im kompakten Monatsformat direkt mit pandas, ohne jede Zeile einzeln zu entpacken."""
+    keys = [key for key in header[len(cyclefile.BASE_COLUMNS):] if key.split(":")[0] in KINDS]
+    marker = LEGACY_SPEEDTEST_MARKER if LEGACY_SPEEDTEST_MARKER in header else None
+    if not text.strip():
+        return parse_cycles([])
+    # Zweimal lesen ist schneller als Text in Zahlen umzuwandeln: einmal als Text für leer/ok/x,
+    # einmal mit Zahlen, die der C-Parser von pandas direkt erkennt. Ohne usecols, denn Zeilen
+    # dürfen kürzer sein als die Kopfzeile, pandas füllt sie dann leer auf.
+    options: dict[str, Any] = {"header": None, "names": header, "index_col": False, "on_bad_lines": "skip"}
+    cells = pd.read_csv(io.StringIO(text), dtype=str, keep_default_na=False, na_filter=False, **options)
+    numbers = pd.read_csv(io.StringIO(text), dtype={"zeit_utc": str, "ebene": str}, keep_default_na=False,
+                          na_values=["", cyclefile.OK_TEXT, cyclefile.FAIL_TEXT], **options)
+    stamps = pd.to_datetime(cells["zeit_utc"], format="%Y-%m-%d %H:%M:%S", utc=True, errors="coerce")
+    valid = stamps.notna().to_numpy()
+    data: dict[str, Any] = {"ts": stamps[valid].reset_index(drop=True)}
+    # Frühere Prüfrunden während eigener Speedtests zählen nur als Lebenszeichen.
+    excluded = cells[marker].fillna("").ne("").to_numpy() if marker else np.zeros(len(cells), dtype=bool)
+    for key in keys:
+        text_cells = cells[key].fillna("")
+        values = numbers[key]
+        if not pd.api.types.is_numeric_dtype(values):  # Nur, wenn ein Fehler einen Grund trägt, etwa "x:Timeout".
+            values = pd.to_numeric(values, errors="coerce")
+        times = values.to_numpy(dtype=np.float32)
+        ok = np.where(np.isnan(times) & text_cells.ne(cyclefile.OK_TEXT).to_numpy(), 0, 1).astype(np.int8)
+        ok[text_cells.eq("").to_numpy() | excluded] = -1
+        ok, times = ok[valid], times[valid]
+        if not (ok >= 0).any():
+            continue
+        times[ok != 1] = np.nan
+        data[key + OK] = ok
+        data[key + MS] = times
+    return pd.DataFrame(data)
 
-    def __init__(self, max_files: int = 45) -> None:
+
+def frame_from_text(text: str, header: list[str]) -> pd.DataFrame:
+    if cyclefile.is_legacy(header):
+        return parse_cycles(parse_cycle_text(text, header))
+    return compact_frame(text, header)
+
+
+def _join(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    frames = [frame for frame in frames if not frame.empty]
+    if not frames:
+        return parse_cycles([])
+    if len(frames) == 1:
+        return frames[0]
+    frame = pd.concat(frames, ignore_index=True, sort=False)
+    for column in frame.columns:
+        if column.endswith(OK):
+            frame[column] = frame[column].fillna(-1).astype(np.int8)
+    return frame
+
+
+@dataclass
+class _CachedFile:
+    identity: tuple[int, int]
+    header_line: bytes
+    header: list[str]
+    offset: int
+    frame: pd.DataFrame
+
+
+def _read_from(path: Path, identity: tuple[int, int]) -> _CachedFile:
+    data = path.read_bytes()
+    complete = data[: data.rfind(b"\n") + 1]
+    header_end = complete.find(b"\n") + 1
+    if header_end == 0:
+        return _CachedFile(identity, b"", [], 0, parse_cycles([]))
+    header_line = complete[:header_end]
+    header = next(csv.reader([header_line.decode("utf-8-sig").strip("\r\n")]))
+    frame = frame_from_text(complete[header_end:].decode("utf-8", errors="replace"), header)
+    return _CachedFile(identity, header_line, header, len(complete), frame)
+
+
+def read_cycle_frame(path: Path) -> pd.DataFrame:
+    try:
+        return _read_from(path, (0, 0)).frame
+    except FileNotFoundError:
+        return parse_cycles([])
+
+
+class SampleCache:
+    """Behält gelesene Monatsdateien im Speicher.
+
+    Die laufende Monatsdatei wächst alle paar Sekunden. Gelesen werden dann nur die neu
+    angehängten Zeilen, nicht wieder die ganze Datei. Ändert sich die Kopfzeile oder wird die
+    Datei ersetzt, wird sie ganz neu gelesen. Ein Monat belegt im Speicher etwa 50 MB.
+    """
+
+    def __init__(self, max_files: int = 4) -> None:
         self._max = max_files
-        self._items: OrderedDict[Path, tuple[tuple[int, int], pd.DataFrame]] = OrderedDict()
+        self._items: OrderedDict[Path, _CachedFile] = OrderedDict()
         self._lock = threading.Lock()
 
     def frame(self, path: Path) -> pd.DataFrame:
         try:
             stat = path.stat()
+            identity = (stat.st_ino, stat.st_dev)
+            with self._lock:
+                cached = self._items.get(path)
+            entry = self._update(path, cached, identity, stat.st_size) if cached else None
+            if entry is None:
+                entry = _read_from(path, identity)
         except FileNotFoundError:
             return parse_cycles([])
-        version = (stat.st_mtime_ns, stat.st_size)
         with self._lock:
-            cached = self._items.get(path)
-            if cached and cached[0] == version:
-                self._items.move_to_end(path)
-                return cached[1]
-        frame = parse_cycles(read_rows(path, CYCLE_COLUMNS))
-        with self._lock:
-            self._items[path] = (version, frame)
+            self._items[path] = entry
             self._items.move_to_end(path)
             while len(self._items) > self._max:
                 self._items.popitem(last=False)
-        return frame
+        return entry.frame
+
+    @staticmethod
+    def _update(path: Path, cached: _CachedFile, identity: tuple[int, int], size: int) -> _CachedFile | None:
+        """Liest nur das Angehängte. None heißt: Die Datei ist eine andere, ganz neu lesen."""
+        if cached.identity != identity or size < cached.offset:
+            return None
+        if size == cached.offset:
+            return cached
+        with path.open("rb") as handle:
+            if handle.readline() != cached.header_line:
+                return None
+            handle.seek(cached.offset)
+            data = handle.read()
+        complete = data[: data.rfind(b"\n") + 1]
+        if not complete:
+            return cached
+        added = frame_from_text(complete.decode("utf-8", errors="replace"), cached.header)
+        return _CachedFile(identity, cached.header_line, cached.header, cached.offset + len(complete),
+                           _join([cached.frame, added]))
 
 
 def load_samples(store: Store, start: datetime, end: datetime, cache: SampleCache | None = None) -> pd.DataFrame:
     files = store.cycle_files(start, end)
-    frames = [cache.frame(path) if cache else parse_cycles(read_rows(path, CYCLE_COLUMNS)) for path in files]
-    frames = [frame for frame in frames if not frame.empty]
-    if not frames:
-        return parse_cycles([])
-    frame = pd.concat(frames, ignore_index=True, sort=False)
-    for column in frame.columns:
-        if column.endswith(OK):
-            frame[column] = frame[column].fillna(-1).astype(np.int8)
+    frame = _join([cache.frame(path) if cache else read_cycle_frame(path) for path in files])
+    if frame.empty:
+        return frame
     low, high = pd.Timestamp(start).tz_convert("UTC"), pd.Timestamp(end).tz_convert("UTC")
     return frame[(frame["ts"] >= low) & (frame["ts"] < high)].reset_index(drop=True)
 

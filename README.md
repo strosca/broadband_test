@@ -128,11 +128,33 @@ Platte geschrieben, ein Absturz kostet also höchstens die gerade laufende Prüf
 
 | Datei | Inhalt |
 |---|---|
-| `pruefungen/pruefungen_JJJJ-MM-TT.csv` | Jede Prüfrunde mit Ergebnis und Antwortzeit je Ziel, eine Datei je Tag nach UTC, rund 8 MB am Tag |
+| `pruefungen/pruefungen_JJJJ-MM.csv` | Jede Prüfrunde, eine Spalte je Ziel, eine Datei je Monat nach UTC, rund 45 MB im Monat |
 | `ausfaelle.csv` | Erkannte Ausfälle mit Ebene, Beginn, Ende und ob das Ende bestätigt ist |
 | `ereignisse.csv` | Warnungen, Messlücken, Routen- und Verbindungswechsel |
 | `sitzungen.csv` | Jeder Start des Dienstes mit Gerät, Verbindungsart, Versionen und Ende |
 | `zustand.csv` | Interne Merkwerte, etwa die ermittelte Route und die aktuelle Verbindung |
+
+**Prüfrunden je Monat.** Eine Zeile sieht so aus:
+
+```
+sitzung,zeit_utc,ebene,lan:192.168.68.1,ext:1.1.1.1,ext:8.8.8.8,dns,dnsref,https,interface
+1,2026-11-08 19:00:18,,3,20,19,20,19,77,ok
+```
+
+Je Ziel steht die Antwortzeit in ms (ab 10 ms ganzzahlig), `ok` bei Erfolg ohne Zeit, `x` bei einem Fehler, oft mit
+Grund wie `x:Timeout`, und nichts, wenn das Ziel in dieser Runde nicht geprüft wurde. Kommt ein Ziel neu hinzu, etwa
+nach einem Netzwechsel, wird die Kopfzeile um eine Spalte verlängert. Ältere Zeilen enden dann einfach früher. Bei 3 s
+Takt hat ein Monat höchstens 892.800 Zeilen, das passt noch in Excel (bis 1.048.576). Bei einem kürzeren Takt nicht
+mehr. Ein Jahr belegt etwa 550 MB.
+
+Monatsgrenzen gelten nach UTC: Die erste Stunde eines Monats in deutscher Zeit steht noch in der Datei des Vormonats.
+Für Auswertungen nach Monat ist das egal, denn `report` und `export` wählen den Zeitraum nach lokaler Zeit über alle
+Dateien hinweg.
+
+Ältere Versionen schrieben eine Datei je Tag mit JSON-Spalte. Der Dienst wandelt sie beim ersten Start einmalig um und
+legt die Originale unter `data/archiv/tagesdateien_vor_umstellung` ab. Danach können sie gelöscht werden. Die Werte
+bleiben gleich, nur DNS- und HTTPS-Zeiten sind auf ganze Millisekunden gerundet. Exporte von vor der Umstellung haben
+deshalb eine andere Prüfsumme als ein neuer Export desselben Zeitraums.
 
 Zeiten stehen in UTC. Die Dateien nutzen Komma und Punkt, für deutsches Excel ist `linkmon export --excel-de` gedacht.
 Ist eine Datei in Excel offen, misst der Dienst weiter und trägt die Zeilen nach, sobald sie wieder frei ist. Ändere die
@@ -199,5 +221,5 @@ unbestätigt markiert.
 ```
 
 Aufbau unter `src/linkmon`: `classify` (Einordnung, ohne Netzzugriff), `net` und `hostinfo` (Prüfungen, Metadaten),
-`monitor` (Dienst), `store` (CSV-Speicher), `clearing` (Messdaten leeren), `quality` (Ping, Verlust, Jitter je Strecke), `stats` (Ausfälle,
+`monitor` (Dienst), `store` und `cyclefile` (CSV-Speicher), `clearing` (Messdaten leeren), `quality` (Ping, Verlust, Jitter je Strecke), `stats` (Ausfälle,
 Verfügbarkeit), `plots`, `report`, `export`, `dashboard`, `cli`.

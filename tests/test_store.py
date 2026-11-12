@@ -54,16 +54,19 @@ def test_half_written_last_line_is_ignored(config: Config, store: Store) -> None
     assert reader.last_cycle_time() == "2026-11-01T10:00:00+00:00"
 
 
-def test_cycles_are_split_by_day_and_read_by_range(config: Config, store: Store) -> None:
-    session = store.start_session(utc(2026, 11, 1), "h", "o", "p", "v", "c")
+def test_cycles_are_split_by_month_and_read_by_range(config: Config, store: Store) -> None:
+    session = store.start_session(utc(2026, 10, 31), "h", "o", "p", "v", "c")
     for hour in (22, 23, 24, 25):
-        store.add_cycle(session, utc(2026, 11, 1) + timedelta(hours=hour), None, {})
-    assert len(list((config.store_dir / CYCLES_DIR).glob("*.csv"))) == 2
+        store.add_cycle(session, utc(2026, 10, 31) + timedelta(hours=hour), None, {})
+    names = sorted(path.name for path in (config.store_dir / CYCLES_DIR).glob("*.csv"))
+    assert names == ["pruefungen_2026-10.csv", "pruefungen_2026-11.csv"]
     reader = Store(config.store_dir, readonly=True)
-    assert reader.cycle_times(utc(2026, 11, 1, 23), utc(2026, 11, 2, 1)) == [
-        "2026-11-01T23:00:00+00:00", "2026-11-02T00:00:00+00:00"]
-    assert reader.first_cycle_time() == "2026-11-01T22:00:00+00:00"
-    assert reader.last_cycle_time() == "2026-11-02T01:00:00+00:00"
+    assert reader.cycle_times(utc(2026, 10, 31, 23), utc(2026, 11, 1, 1)) == [
+        "2026-10-31T23:00:00+00:00", "2026-11-01T00:00:00+00:00"]
+    assert reader.cycle_times(utc(2026, 11, 1), utc(2026, 11, 2)) == [
+        "2026-11-01T00:00:00+00:00", "2026-11-01T01:00:00+00:00"]
+    assert reader.first_cycle_time() == "2026-10-31T22:00:00+00:00"
+    assert reader.last_cycle_time() == "2026-11-01T01:00:00+00:00"
     assert reader.count_cycles() == 4
 
 
