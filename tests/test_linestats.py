@@ -8,7 +8,7 @@ from conftest import utc
 
 from linkmon.config import Config
 from linkmon.dashboard import create_report_file, report_bounds, report_filename
-from linkmon.linestats import LineStatistics, plain_duration
+from linkmon.linestats import LineStatistics, measured_interval, plain_duration
 from linkmon.report import hop_state, summary_sentences
 from linkmon.stats import Outage
 from linkmon.store import Store
@@ -137,3 +137,13 @@ def test_web_report_is_built_and_kept_on_the_device(config: Config, seeded: tupl
     assert Path(config.data_dir / "berichte") in pdf.parents
     assert (pdf.parent / "rohdaten" / "rohdaten.jsonl").is_file()
     assert filename.endswith("_bis_2026-11-03.pdf")
+
+
+def test_interval_comes_from_the_data_not_the_config(config: Config) -> None:
+    start = utc(2026, 11, 1)
+    stamps = _stamps(start, start + timedelta(hours=1), step_s=3) + [start + timedelta(hours=5)]
+    assert measured_interval(stamps) == 3
+    assert measured_interval([start]) is None
+    stats = _stats([], start, start + timedelta(days=1))
+    text = " ".join(summary_sentences(stats.period("Gesamt", start, start + timedelta(days=1)), config, 30.0))
+    assert "alle 30 Sekunden" in text and "ab etwa 90 Sekunden" in text

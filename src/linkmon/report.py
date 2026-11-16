@@ -33,7 +33,7 @@ from linkmon import __version__
 from linkmon.config import Config
 from linkmon.export import ExportResult, export_range
 from linkmon.levels import LEVEL_LABELS, LEVEL_ORDER, Level
-from linkmon.linestats import ClassRow, LineStatistics, PeriodStats, plain_duration
+from linkmon.linestats import ClassRow, LineStatistics, PeriodStats, measured_interval, plain_duration
 from linkmon.monitor import monitor_gap_threshold
 from linkmon.plots import MAIN_FIGURE, PlotContext, render_all
 from linkmon.quality import load_samples
@@ -216,11 +216,15 @@ def _when(moment: datetime, config: Config) -> str:
     return moment.astimezone(config.zone).strftime("%d.%m.%Y um %H:%M Uhr")
 
 
-def summary_sentences(total: PeriodStats, config: Config) -> list[str]:
-    """Die Kernaussage in ganzen Sätzen, verständlich ohne Fachwissen."""
+def summary_sentences(total: PeriodStats, config: Config, interval_s: float | None = None) -> list[str]:
+    """Die Kernaussage in ganzen Sätzen, verständlich ohne Fachwissen.
+
+    interval_s ist der tatsächliche Abstand der Prüfungen in den Daten, ohne Daten der aus der Konfiguration.
+    """
     reach = config.reachability
     provider = escape(_provider(config))
-    minimum = reach.failure_threshold * reach.interval_s
+    interval = interval_s or reach.interval_s
+    minimum = reach.failure_threshold * interval
     if total.coverage_pct is None:
         return ["Für diesen Zeitraum liegen keine Messungen vor."]
     sentences: list[str] = []
@@ -235,7 +239,7 @@ def summary_sentences(total: PeriodStats, config: Config) -> list[str]:
     else:
         sentences.append("Im Messzeitraum wurde <b>kein Ausfall</b> der Internetverbindung festgestellt.")
     sentences.append(f"Gemessen wurde während {number(total.coverage_pct, 1)} % des Zeitraums, alle "
-                     f"{reach.interval_s:g} Sekunden.")
+                     f"{interval:g} Sekunden.")
     sentences.append(f"Gezählt sind nur Ausfälle, bei denen das eigene Heimnetz funktionierte und der Router "
                      f"antwortete, das Internet aber über die Leitung von {provider} nicht erreichbar war. "
                      f"Erkannt werden Unterbrechungen ab etwa {minimum:g} Sekunden.")
@@ -409,15 +413,17 @@ def _warnings_block(warnings: list[str], styles: dict[str, ParagraphStyle]) -> l
     return [Spacer(1, 8), table]
 
 
-def _methodology(config: Config, sessions: list[dict[str, Any]], styles: dict[str, ParagraphStyle]) -> list[Any]:
+def _methodology(config: Config, sessions: list[dict[str, Any]], styles: dict[str, ParagraphStyle],
+                 interval_s: float | None = None) -> list[Any]:
     reach = config.reachability
+    interval = interval_s or reach.interval_s
     rows: list[tuple[str, Any]] = [
         ("Messgerät", _distinct(sessions, "hostname")),
         ("Betriebssystem", _distinct(sessions, "os")),
         ("Netzwerkinterface", _distinct(sessions, "interface")),
         ("Verbindungsart", _connection_text(sessions)),
         ("Messsoftware", f"linkmon {_distinct(sessions, 'linkmon_version')}, Python {_distinct(sessions, 'python_version')}"),
-        ("Prüfung", f"alle {reach.interval_s:g} s parallel: je ein Ping an Router im Heimnetz, ersten Provider-Hop und "
+        ("Prüfung", f"alle {interval:g} s parallel: je ein Ping an Router im Heimnetz, ersten Provider-Hop und "
                     f"{', '.join(reach.external_targets)}, dazu eine DNS-Abfrage (System, eigener DNS-Server im "
                     f"Heimnetz und zum Vergleich {', '.join(reach.dns_reference_servers) or 'kein öffentlicher Server'})"
                     " und ein HTTPS-Abruf"),
@@ -607,7 +613,8 @@ def _build(config: Config, store: Store, start: datetime, end: datetime, directo
 
     story: list[Any] = []
     story += _intro(config, summary, styles, created, effective_end)
-    story += [Spacer(1, 8), Paragraph(" ".join(summary_sentences(total, config)), styles["body"])]
+    interval = measured_interval(stamps)
+    story += [Spacer(1, 8), Paragraph(" ".join(summary_sentences(total, config, interval)), styles["body"])]
     story += _headline(total, styles)
     story += _warnings_block(collect_warnings(summary, sessions, outages), styles)
     story += _period_section(line, start, effective_end, config, styles)
@@ -617,7 +624,7 @@ def _build(config: Config, store: Store, start: datetime, end: datetime, directo
     story += _line_list(line, config, styles)
     story += _legal_note(styles)
     story += _appendix_intro(styles)
-    story += _methodology(config, sessions, styles)
+    story += _methodology(config, sessions, styles, interval)
     story += _metrics(summary, styles)
     story += _outage_table(outages, config, styles)
     story += _figures(pngs, styles)

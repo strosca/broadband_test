@@ -163,6 +163,19 @@ class LineStatistics:
         return rows
 
 
+def measured_interval(stamps: list[datetime]) -> float | None:
+    """Typischer Abstand zweier Prüfrunden in den Daten, gerundet auf ganze Sekunden.
+
+    Der Bericht nennt diesen Wert statt des Werts aus der Konfiguration: Wurde die Konfiguration nach der Messung
+    geändert, stünde sonst ein falsches Intervall im Bericht.
+    """
+    if len(stamps) < 2:
+        return None
+    ordered = sorted(stamps)
+    gaps = sorted((b - a).total_seconds() for a, b in zip(ordered, ordered[1:]))
+    return float(round(gaps[len(gaps) // 2]))
+
+
 def plain_duration(seconds: float) -> str:
     """Dauer zum Vorlesen: „1 Std. 5 Min.“ statt „01:05:00“."""
     total = int(round(seconds))
