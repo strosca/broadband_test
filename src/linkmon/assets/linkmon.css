@@ -73,6 +73,28 @@ html, body {
 .brand-title { font-size: 16px; font-weight: 650; letter-spacing: -0.01em; }
 .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
 
+/* Knopf für den PDF-Bericht */
+.button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 14px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: var(--accent);
+  color: #fff;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: filter 0.12s;
+}
+.button:hover { filter: brightness(1.12); }
+.button:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+.button-icon { font-size: 14px; line-height: 1; }
+.report-status { min-height: 18px; color: var(--ink-3); font-size: 12px; }
+
 /* Umschalter */
 .segmented, .segmented > div {
   display: inline-flex;

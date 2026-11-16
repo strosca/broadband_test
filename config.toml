@@ -28,6 +28,7 @@ refresh_s = 30
 
 [report]
 # Optional, erscheint auf der ersten Seite des Berichts:
+provider = "Vodafone"           # Name des Anbieters in Überschriften und Erklärungen
 tariff = "Vodafone Kabel 250"
 # customer_name = ""
 # customer_number = ""

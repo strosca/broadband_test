@@ -115,7 +115,17 @@ Prüfrunde und misst ohne Lücke weiter. Erhalten bleiben die ermittelte Route, 
 | Befehl | Ergebnis |
 |---|---|
 | `linkmon report --from 2026-11-01 --to 2026-11-30` | `bericht.pdf`, Abbildungen als PDF, SVG und PNG, Rohdaten mit Prüfsumme |
+| Knopf **PDF-Bericht** im Webinterface | dasselbe für den oben gewählten Zeitraum, das PDF wird direkt heruntergeladen |
 | `linkmon export --from 2026-11-01 --to 2026-11-30` | `ausfaelle.csv`, `qualitaet_minuten.csv`, `rohdaten.jsonl`, `SHA256SUMS.txt` (`--excel-de` für deutsches Excel) |
+
+Der Bericht ist zweigeteilt. Die ersten Seiten sind für die Störungsmeldung beim Anbieter gedacht und zählen nur
+Ausfälle der Leitung: Zusammenfassung in ganzen Sätzen, Kennzahlen für die letzten 24 Stunden, 7 und 30 Tage, je
+Kalenderwoche und je Tag, Verteilung nach Dauer und Tageszeit und eine Liste aller Ausfälle mit Beginn, Ende und Dauer.
+Ereignisse im eigenen Heimnetz, Ping-Werte und Messmethode stehen im technischen Anhang, damit sie die Aussage über die
+Leitung nicht verwässern. Der Name des Anbieters kommt aus `provider` in `[report]` (Standard: Vodafone).
+
+Ein Bericht aus dem Webinterface bleibt wie bei `linkmon report` zusätzlich unter `data/berichte` liegen, samt
+Abbildungen und Rohdaten mit Prüfsumme. Für 30 Tage braucht er auf einem kleinen Rechner bis zu einer Minute.
 
 Datumsangaben gelten in lokaler Zeit, `--to` einschließlich des ganzen Tages. Ausgaben landen unter `data/berichte` und
 `data/exporte`, sofern `--out` nichts anderes vorgibt. `qualitaet_minuten.csv` enthält je Minute und Strecke die Zahl der

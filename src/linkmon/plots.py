@@ -18,9 +18,9 @@ from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 
-from linkmon.levels import LEVEL_COLORS, LEVEL_LABELS, LEVEL_ORDER
+from linkmon.levels import LEVEL_COLORS, LEVEL_LABELS, LEVEL_ORDER, Level
 from linkmon.quality import INTERNET, Track, bucket_size, bucket_table, days_between, find_track, hour_matrix, ping_tracks
-from linkmon.stats import Coverage, Outage
+from linkmon.stats import Coverage, Outage, merge_intervals, split_by_day
 
 matplotlib.use("Agg")
 
@@ -292,7 +292,57 @@ def fig_heatmap_ping(context: PlotContext) -> Figure:
     return _heatmap(context, "p95", "Ping-Spitzen nach Tageszeit", "Ping P95 (ms)")
 
 
+def fig_line_per_day(context: PlotContext) -> Figure:
+    """Hauptabbildung: Ausfallzeit der Leitung je Tag, über jedem Balken die Zahl der Ausfälle.
+
+    Messlücken erscheinen als graue Markierung unter der Achse, damit ein leerer Tag ohne Messung
+    nicht wie ein störungsfreier Tag aussieht.
+    """
+    days = days_between(context.start, context.end, context.zone)
+    line = [o for o in context.outages if o.level == Level.LINE]
+    minutes = dict.fromkeys(days, 0.0)
+    counts = dict.fromkeys(days, 0)
+    for begin, finish in merge_intervals([(o.start, o.end) for o in line]):
+        for day, seconds in split_by_day(begin, finish, context.zone).items():
+            if day in minutes:
+                minutes[day] += seconds / 60
+    for outage in line:
+        day = outage.start.astimezone(context.zone).strftime("%Y-%m-%d")
+        if day in counts:
+            counts[day] += 1
+    monitored = context.coverage.monitored_by_day
+    subtitle = (f"n = {len(line)} Ausfälle, zusammen {sum(minutes.values()):.0f} Minuten  ·  "
+                f"Messzeitraum {context.period_text}")
+    figure, (ax,) = _new_figure("Ausfallzeit der Internetleitung je Tag", subtitle, height=3.6)
+    positions = np.arange(len(days))
+    values = [minutes[day] for day in days]
+    ax.bar(positions, values, width=0.72, color=LEVEL_COLORS[Level.LINE], linewidth=0)
+    top = max(values, default=0.0)
+    for position, day in zip(positions, days):
+        if counts[day]:
+            ax.text(position, minutes[day] + max(top, 1) * 0.02, f"{counts[day]}×", ha="center", va="bottom",
+                    fontsize=6.5 if len(days) > 20 else 7.5, color=COLOR_TEXT)
+        if context.coverage.cycles and monitored.get(day, 0.0) < 0.95 * 86400:
+            ax.plot([position - 0.36, position + 0.36], [0, 0], color=COLOR_MUTED, linewidth=3,
+                    solid_capstyle="butt", clip_on=False, zorder=3)
+    ax.set_ylim(0, max(top * 1.18, 1))
+    ax.set_xlim(-0.6, len(days) - 0.4)
+    ax.set_ylabel("Minuten ohne Internet")
+    step = max(1, math.ceil(len(days) / 16))
+    shown = positions[::step]
+    ax.set_xticks(shown, [f"{days[i][8:10]}.{days[i][5:7]}." for i in shown], fontsize=7)
+    ax.grid(axis="x", visible=False)
+    ax.set_xlabel("Tag (Zahl über dem Balken: Anzahl der Ausfälle, grauer Strich: Tag nicht vollständig gemessen)")
+    if not line:
+        _no_data(ax, "Keine Ausfälle der Leitung im Zeitraum")
+    return figure
+
+
+# Die Hauptabbildung steht im Bericht vorne, die übrigen im technischen Anhang.
+MAIN_FIGURE = "0_leitung_je_tag"
+
 FIGURES = {
+    MAIN_FIGURE: fig_line_per_day,
     "a_ausfall_zeitleiste": fig_gantt,
     "b_ping_verlauf": fig_ping,
     "c_paketverlust": fig_loss,

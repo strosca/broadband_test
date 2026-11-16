@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -17,18 +18,28 @@ from reportlab.lib.units import cm
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import Image, KeepTogether, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import (
+    Image,
+    KeepTogether,
+    PageBreak,
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
 
 from linkmon import __version__
 from linkmon.config import Config
 from linkmon.export import ExportResult, export_range
-from linkmon.levels import LEVEL_LABELS, LEVEL_ORDER
+from linkmon.levels import LEVEL_LABELS, LEVEL_ORDER, Level
+from linkmon.linestats import ClassRow, LineStatistics, PeriodStats, plain_duration
 from linkmon.monitor import monitor_gap_threshold
-from linkmon.plots import PlotContext, render_all
-from linkmon.quality import INTERNET, load_samples
-from linkmon.stats import Coverage, Outage, Summary, compute_summary, load_coverage, load_outages
+from linkmon.plots import MAIN_FIGURE, PlotContext, render_all
+from linkmon.quality import load_samples
+from linkmon.stats import Coverage, Outage, Summary, compute_coverage, compute_summary, load_outages
 from linkmon.store import Store
-from linkmon.timeutil import format_duration, format_local, now_utc
+from linkmon.timeutil import format_duration, format_local, now_utc, parse_iso
 
 PAGE_WIDTH = A4[0] - 3.6 * cm
 INK = colors.HexColor("#0b0b0b")
@@ -36,10 +47,16 @@ MUTED = colors.HexColor("#52514e")
 RULE = colors.HexColor("#e1e0d9")
 HEADER_FILL = colors.HexColor("#f3f2ee")
 WARNING_FILL = colors.HexColor("#fdf3dc")
-TITLE = "Bericht zur Verfügbarkeit des Internetanschlusses"
+LINE_FILL = colors.HexColor("#fbe9e8")
+LINE_INK = colors.HexColor("#b3302f")
+TITLE = "Störungsprotokoll Internetanschluss"
 CONNECTION_LABELS = {"lan": "LAN", "wlan": "WLAN", "unbekannt": "nicht erkannt"}
+# Bauen mehrere Geräte gleichzeitig einen Bericht über das Webinterface, wechseln sich die Aufrufe ab:
+# matplotlib setzt seine Stileinstellungen global.
+_BUILD_LOCK = threading.Lock()
 
 FIGURE_CAPTIONS = {
+    MAIN_FIGURE: "Abbildung 1: Ausfallzeit der Internetleitung je Tag",
     "a_ausfall_zeitleiste": "Abbildung a: Ausfälle nach Ebene",
     "b_ping_verlauf": "Abbildung b: Ping im Zeitverlauf",
     "c_paketverlust": "Abbildung c: Paketverlust im Zeitverlauf",
@@ -69,7 +86,13 @@ def _styles() -> dict[str, ParagraphStyle]:
         "body": body,
         "small": ParagraphStyle("small", parent=body, fontSize=7, leading=9.5, textColor=MUTED, spaceAfter=2),
         "cell": ParagraphStyle("cell", parent=body, fontSize=7, leading=8.8, spaceAfter=0),
-        "title": ParagraphStyle("title", parent=body, fontName="Body-Bold", fontSize=18, leading=23, spaceAfter=3),
+        "title": ParagraphStyle("title", parent=body, fontName="Body-Bold", fontSize=18, leading=23, spaceAfter=1),
+        "subtitle": ParagraphStyle("subtitle", parent=body, fontSize=10, leading=13, textColor=MUTED, spaceAfter=8),
+        "figure": ParagraphStyle("figure", parent=body, fontName="Body-Bold", fontSize=13, leading=16, spaceAfter=0),
+        "figure_label": ParagraphStyle("figure_label", parent=body, fontSize=7.5, leading=9.5, textColor=MUTED,
+                                       spaceAfter=0),
+        "appendix": ParagraphStyle("appendix", parent=body, fontName="Body-Bold", fontSize=15, leading=19,
+                                   spaceAfter=4),
         "h1": ParagraphStyle("h1", parent=body, fontName="Body-Bold", fontSize=12, leading=15, spaceBefore=11,
                              spaceAfter=5, keepWithNext=1),
         "h2": ParagraphStyle("h2", parent=body, fontName="Body-Bold", fontSize=9.5, leading=12, spaceBefore=7,
@@ -145,7 +168,7 @@ def _footer(canvas: Any, document: Any) -> None:
     canvas.saveState()
     canvas.setFont("Body", 7)
     canvas.setFillColor(MUTED)
-    canvas.drawString(1.8 * cm, 1.0 * cm, f"Verfügbarkeitsbericht, erzeugt mit linkmon {__version__}")
+    canvas.drawString(1.8 * cm, 1.0 * cm, f"{TITLE}, automatisch erzeugt mit linkmon {__version__}")
     canvas.drawRightString(A4[0] - 1.8 * cm, 1.0 * cm, f"Seite {document.page}")
     canvas.restoreState()
 
@@ -163,15 +186,25 @@ def _distinct(rows: list[dict[str, Any]], key: str) -> str:
     return ", ".join(values) if values else "–"
 
 
-def _intro(config: Config, summary: Summary, styles: dict[str, ParagraphStyle], created: datetime) -> list[Any]:
+def _provider(config: Config) -> str:
+    return config.report.provider or "des Anbieters"
+
+
+def _intro(config: Config, summary: Summary, styles: dict[str, ParagraphStyle], created: datetime,
+           effective_end: datetime) -> list[Any]:
     zone = config.zone
-    story: list[Any] = [Paragraph(TITLE, styles["title"])]
-    last = summary.end - timedelta(seconds=1)
+    story: list[Any] = [
+        Paragraph(TITLE, styles["title"]),
+        Paragraph(f"Ausfälle der Internetverbindung über die Leitung von {escape(_provider(config))}",
+                  styles["subtitle"]),
+    ]
+    last = effective_end - timedelta(seconds=1)
     rows: list[tuple[str, Any]] = [("Messzeitraum", f"{format_local(summary.start, zone)} bis {format_local(last, zone)} "
                                                     f"({config.general.timezone})")]
     report = config.report
-    for label, value in (("Tarif", report.tariff), ("Anschlussinhaber", report.customer_name),
-                         ("Kundennummer", report.customer_number), ("Anschlussadresse", report.address)):
+    for label, value in (("Anbieter", report.provider), ("Tarif", report.tariff),
+                         ("Anschlussinhaber", report.customer_name), ("Kundennummer", report.customer_number),
+                         ("Anschlussadresse", report.address)):
         if value:
             rows.append((label, value))
     rows.append(("Bericht erzeugt", format_local(created, zone)))
@@ -179,28 +212,185 @@ def _intro(config: Config, summary: Summary, styles: dict[str, ParagraphStyle], 
     return story
 
 
+def _when(moment: datetime, config: Config) -> str:
+    return moment.astimezone(config.zone).strftime("%d.%m.%Y um %H:%M Uhr")
+
+
+def summary_sentences(total: PeriodStats, config: Config) -> list[str]:
+    """Die Kernaussage in ganzen Sätzen, verständlich ohne Fachwissen."""
+    reach = config.reachability
+    provider = escape(_provider(config))
+    minimum = reach.failure_threshold * reach.interval_s
+    if total.coverage_pct is None:
+        return ["Für diesen Zeitraum liegen keine Messungen vor."]
+    sentences: list[str] = []
+    if total.count:
+        times = "einmal" if total.count == 1 else f"<b>{total.count}-mal</b>"
+        # Die Dauer steht nie am Satzende: „5 Min..“ sähe nach einem Fehler aus.
+        sentences.append(f"Im Messzeitraum war die Internetverbindung {times} unterbrochen. Insgesamt war der "
+                         f"Anschluss <b>{plain_duration(total.downtime_s)}</b> ohne Internet.")
+        if total.longest is not None and total.count > 1:
+            sentences.append(f"Der längste Ausfall dauerte <b>{plain_duration(total.longest.duration_s)}</b> und "
+                             f"begann am {_when(total.longest.start, config)}.")
+    else:
+        sentences.append("Im Messzeitraum wurde <b>kein Ausfall</b> der Internetverbindung festgestellt.")
+    sentences.append(f"Gemessen wurde während {number(total.coverage_pct, 1)} % des Zeitraums, alle "
+                     f"{reach.interval_s:g} Sekunden.")
+    sentences.append(f"Gezählt sind nur Ausfälle, bei denen das eigene Heimnetz funktionierte und der Router "
+                     f"antwortete, das Internet aber über die Leitung von {provider} nicht erreichbar war. "
+                     f"Erkannt werden Unterbrechungen ab etwa {minimum:g} Sekunden.")
+    return sentences
+
+
+def _headline(total: PeriodStats, styles: dict[str, ParagraphStyle]) -> list[Any]:
+    """Vier große Zahlen: wie oft, wie lange, längster Ausfall, Verfügbarkeit."""
+    figures = [
+        (str(total.count), "Ausfälle"),
+        (plain_duration(total.downtime_s) if total.count else "0", "ohne Internet, zusammen"),
+        (plain_duration(total.longest_s) if total.longest else "–", "längster Ausfall"),
+        (number(total.availability_pct, 2, " %"), "Verfügbarkeit (gemessene Zeit)"),
+    ]
+    cells = [[Paragraph(escape(value), styles["figure"]) for value, _ in figures],
+             [Paragraph(escape(label), styles["figure_label"]) for _, label in figures]]
+    table = Table(cells, colWidths=[PAGE_WIDTH / 4] * 4)
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), LINE_FILL if total.count else HEADER_FILL),
+        ("LINEAFTER", (0, 0), (-2, -1), 2, colors.white),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("TOPPADDING", (0, 0), (-1, 0), 8),
+        ("BOTTOMPADDING", (0, -1), (-1, -1), 8),
+        ("LEFTPADDING", (0, 0), (-1, -1), 7),
+    ]))
+    return [Spacer(1, 4), table, Spacer(1, 4)]
+
+
+def _short_stamp(moment: datetime, config: Config) -> str:
+    return moment.astimezone(config.zone).strftime("%d.%m.%y %H:%M")
+
+
+def _period_rows(rows: list[PeriodStats], config: Config, styles: dict[str, ParagraphStyle], *,
+                 with_span: bool) -> list[list[Any]]:
+    head = ["Zeitraum", "von – bis", "gemessen", "Ausfälle", "ohne Internet", "längster", "verfügbar"]
+    table: list[list[Any]] = [head if with_span else [head[0], *head[2:]]]
+    for row in rows:
+        span = Paragraph(f"{_short_stamp(row.start, config)} – {_short_stamp(row.end - timedelta(seconds=1), config)}",
+                         styles["cell"])
+        cells: list[Any] = [Paragraph(f"<b>{escape(row.label)}</b>", styles["cell"])]
+        if with_span:
+            cells.append(span)
+        cells += [
+            number(row.coverage_pct, 1, " %"), str(row.count),
+            plain_duration(row.downtime_s) if row.count else "–",
+            plain_duration(row.longest_s) if row.longest else "–",
+            number(row.availability_pct, 2, " %"),
+        ]
+        table.append(cells)
+    return table
+
+
+def _period_section(stats: LineStatistics, start: datetime, end: datetime, config: Config,
+                    styles: dict[str, ParagraphStyle]) -> list[Any]:
+    story: list[Any] = [Paragraph("Ausfälle nach Zeitraum", styles["h1"])]
+    rolling = stats.rolling(start, end)
+    story.append(_table(_period_rows(rolling, config, styles, with_span=True),
+                        [w * cm for w in (3.0, 4.6, 1.7, 1.5, 2.3, 2.2, 2.1)]))
+    story.append(Paragraph("„gemessen“: Anteil des Zeitraums, in dem linkmon lief. Die Verfügbarkeit bezieht sich "
+                           "nur auf diese Zeit. Ein Ausfall, der über eine Zeitraumgrenze reicht, zählt in beiden "
+                           "Zeiträumen.", styles["small"]))
+    weeks = stats.weeks(start, end)
+    if len(weeks) > 1:
+        story.append(Paragraph("Nach Kalenderwochen", styles["h2"]))
+        story.append(_table(_period_rows(weeks, config, styles, with_span=True),
+                            [w * cm for w in (3.0, 4.6, 1.7, 1.5, 2.3, 2.2, 2.1)]))
+    return story
+
+
+def _class_table(title: str, rows: list[ClassRow], styles: dict[str, ParagraphStyle], width: float) -> Table:
+    data: list[list[Any]] = [[title, "Anzahl", "zusammen"]]
+    for row in rows:
+        data.append([Paragraph(escape(row.label), styles["cell"]), str(row.count),
+                     plain_duration(row.downtime_s) if row.count else "–"])
+    return _table(data, [width - 3.9 * cm, 1.4 * cm, 2.5 * cm])
+
+
+def _pattern_section(stats: LineStatistics, styles: dict[str, ParagraphStyle]) -> list[Any]:
+    if not stats.outages:
+        return []
+    half = (PAGE_WIDTH - 0.6 * cm) / 2
+    pair = Table([[_class_table("Dauer des Ausfalls", stats.by_duration(), styles, half),
+                   _class_table("Beginn nach Tageszeit", stats.by_daytime(), styles, half)]],
+                 colWidths=[half + 0.3 * cm, half + 0.3 * cm])
+    pair.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                              ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
+    return [Paragraph("Wie lange und wann?", styles["h1"]), pair]
+
+
+def _days_section(stats: LineStatistics, config: Config, styles: dict[str, ParagraphStyle]) -> list[Any]:
+    days = stats.days_with_outages()
+    if not days:
+        return []
+    rows: list[list[Any]] = [["Tag", "gemessen", "Ausfälle", "ohne Internet", "längster", "verfügbar"]]
+    for row in days:
+        rows.append([row.label, number(row.coverage_pct, 1, " %"), str(row.count), plain_duration(row.downtime_s),
+                     plain_duration(row.longest_s), number(row.availability_pct, 2, " %")])
+    return [
+        Paragraph("Tage mit Ausfällen", styles["h1"]),
+        _table(rows, [w * cm for w in (3.0, 2.2, 2.0, 3.6, 3.6, 3.0)]),
+        Paragraph("Tage ohne Ausfall der Leitung sind nicht aufgeführt. Ein Ausfall über Mitternacht zählt an "
+                  "beiden Tagen.", styles["small"]),
+    ]
+
+
+def hop_state(detail: str) -> str:
+    """Ob der erste Knoten im Netz des Anbieters noch antwortete. Grenzt die Fehlerstelle ein."""
+    if detail.startswith("Erster Provider-Hop erreichbar"):
+        return "erreichbar"
+    if detail.startswith("Erster Provider-Hop und"):
+        return "nicht erreichbar"
+    return "nicht geprüft"
+
+
+def _line_list(stats: LineStatistics, config: Config, styles: dict[str, ParagraphStyle]) -> list[Any]:
+    provider = escape(_provider(config))
+    story: list[Any] = [Paragraph(f"Liste aller Ausfälle der Leitung ({len(stats.outages)})", styles["h1"])]
+    if not stats.outages:
+        story.append(Paragraph("Im Zeitraum wurde kein Ausfall der Leitung erkannt.", styles["body"]))
+        return story
+    rows: list[list[Any]] = [["Nr.", "Beginn", "Ende", "Dauer", f"Erster Knoten von {provider}"]]
+    uncertain = False
+    for position, outage in enumerate(stats.outages, start=1):
+        end = format_local(outage.end, config.zone)
+        if outage.ongoing:
+            end += " *"
+            uncertain = True
+        elif not outage.confirmed:
+            end += " *"
+            uncertain = True
+        rows.append([str(position), format_local(outage.start, config.zone), end, plain_duration(outage.duration_s),
+                     hop_state(outage.detail)])
+    story.append(_table(rows, [w * cm for w in (1.0, 3.6, 3.9, 3.4, 5.5)], font_size=7, align_right_from=99))
+    notes = [f"Zeiten in lokaler Zeit ({config.general.timezone}), sekundengenau. „Erster Knoten“: der erste Router "
+             f"im Netz von {provider} hinter dem eigenen Anschluss. Antwortet er nicht, liegt die Störung zwischen "
+             "Hausanschluss und diesem Knoten."]
+    if uncertain:
+        notes.append("* Ende nicht sicher bestimmt (linkmon lief zwischendurch nicht oder der Ausfall dauert noch "
+                     "an). Die tatsächliche Dauer kann länger sein.")
+    story += [Paragraph(escape(note), styles["small"]) for note in notes]
+    return story
+
+
+def _main_figure(pngs: dict[str, Path], styles: dict[str, ParagraphStyle]) -> list[Any]:
+    path = pngs.get(MAIN_FIGURE)
+    if path is None:
+        return []
+    width, height = ImageReader(str(path)).getSize()
+    scale = PAGE_WIDTH / width
+    return [Spacer(1, 6), KeepTogether([Image(str(path), width=PAGE_WIDTH, height=height * scale),
+                                        Paragraph(FIGURE_CAPTIONS[MAIN_FIGURE], styles["small"])])]
+
+
 def _ms(value: float | None) -> str:
     return number(value, 0, " ms") if value is not None else "–"
-
-
-def _key_figures(summary: Summary, styles: dict[str, ParagraphStyle]) -> list[Any]:
-    internet = summary.track(INTERNET)
-    rows: list[tuple[str, str]] = [
-        ("Verfügbarkeit der Leitung", number(summary.availability_pct, 3, " %") + "  (bezogen auf die überwachte Zeit)"),
-        ("Überwachte Zeit", f"{format_duration(summary.monitored_s)}  "
-                            f"({number(summary.coverage_pct, 1, ' %')} des Zeitraums)"),
-        ("Leitungsausfälle", f"{summary.outage_count.get('line', 0)}, zusammen {format_duration(summary.line_downtime_s)}"),
-        ("Ausfälle aller Ebenen", str(sum(summary.outage_count.values()))),
-    ]
-    if internet:
-        rows += [
-            ("Ping ins Internet", f"Median {_ms(internet.median_ms)}, P95 {_ms(internet.p95_ms)}, "
-                                  f"Maximum {_ms(internet.max_ms)}"),
-            ("Paketverlust ins Internet", f"{number(internet.loss_pct, 2, ' %')}  ({internet.lost} von "
-                                          f"{internet.sent} Pings unbeantwortet)"),
-            ("Jitter ins Internet", number(internet.jitter_ms, 1, " ms")),
-        ]
-    return [Paragraph("Kennzahlen im Überblick", styles["h1"]), _key_values(rows)]
 
 
 def _warnings_block(warnings: list[str], styles: dict[str, ParagraphStyle]) -> list[Any]:
@@ -259,7 +449,7 @@ def _methodology(config: Config, sessions: list[dict[str, Any]], styles: dict[st
         "kein Beleg für eine Störung. Die Geschwindigkeit des Anschlusses misst dieses Tool nicht."
     )
     return [
-        Paragraph("Methodik", styles["h1"]),
+        Paragraph("A1 Messmethode", styles["h1"]),
         _key_values(rows),
         Spacer(1, 6),
         Paragraph(method_text, styles["body"]),
@@ -269,7 +459,8 @@ def _methodology(config: Config, sessions: list[dict[str, Any]], styles: dict[st
 
 
 def _metrics(summary: Summary, styles: dict[str, ParagraphStyle]) -> list[Any]:
-    story: list[Any] = [Paragraph("Kennzahlen", styles["h1"]), Paragraph("Verbindungsqualität je Strecke", styles["h2"])]
+    story: list[Any] = [Paragraph("A2 Kennzahlen aller Prüfungen", styles["h1"]),
+                        Paragraph("Verbindungsqualität je Strecke", styles["h2"])]
     if summary.tracks:
         rows: list[list[Any]] = [["Strecke", "Prüfungen", "Verlust", "Median", "P95", "Maximum", "Jitter"]]
         for item in summary.tracks:
@@ -282,7 +473,7 @@ def _metrics(summary: Summary, styles: dict[str, ParagraphStyle]) -> list[Any]:
     else:
         story.append(Paragraph("Keine Prüfungen im Zeitraum.", styles["body"]))
 
-    story.append(Paragraph("Ausfälle nach Ebene", styles["h2"]))
+    story.append(Paragraph("Ereignisse nach Ebene", styles["h2"]))
     outage_rows = [["Ebene", "Anzahl", "Gesamtdauer"]]
     for level in LEVEL_ORDER:
         outage_rows.append([LEVEL_LABELS[level], str(summary.outage_count.get(level, 0)),
@@ -309,9 +500,16 @@ def _metrics(summary: Summary, styles: dict[str, ParagraphStyle]) -> list[Any]:
 
 
 def _outage_table(outages: list[Outage], config: Config, styles: dict[str, ParagraphStyle]) -> list[Any]:
-    story: list[Any] = [Paragraph("Alle Ausfälle", styles["h1"])]
+    """Alle Ereignisse außer Leitungsausfällen: Heimnetz, DNS, HTTPS. Sie stehen bewusst nur im Anhang."""
+    outages = [outage for outage in outages if outage.level != Level.LINE]
+    story: list[Any] = [
+        Paragraph("A3 Weitere Ereignisse (nicht in den Zahlen auf den ersten Seiten)", styles["h1"]),
+        Paragraph("Störungen im eigenen Heimnetz (Router/LAN, Lokal, DNS Heimnetz) liegen nicht im "
+                  "Verantwortungsbereich des Anbieters. Nur DNS und Nur HTTPS sind Störungen einzelner Dienste bei "
+                  "stehender Verbindung. Sie sind hier der Vollständigkeit halber aufgeführt.", styles["body"]),
+    ]
     if not outages:
-        story.append(Paragraph("Im Zeitraum wurden keine Ausfälle erkannt.", styles["body"]))
+        story.append(Paragraph("Im Zeitraum gab es keine weiteren Ereignisse.", styles["body"]))
         return story
     zone = config.zone
     rows: list[list[Any]] = [["Start", "Ende", "Dauer", "Ebene", "Befund"]]
@@ -331,8 +529,10 @@ def _outage_table(outages: list[Outage], config: Config, styles: dict[str, Parag
 
 
 def _figures(pngs: dict[str, Path], styles: dict[str, ParagraphStyle]) -> list[Any]:
-    story: list[Any] = [Paragraph("Abbildungen", styles["h1"])]
+    story: list[Any] = [Paragraph("A4 Abbildungen", styles["h1"])]
     for name, path in pngs.items():
+        if name == MAIN_FIGURE:
+            continue
         width, height = ImageReader(str(path)).getSize()
         scale = PAGE_WIDTH / width
         story.append(KeepTogether([
@@ -356,12 +556,13 @@ def _legal_note(styles: dict[str, ParagraphStyle]) -> list[Any]:
 
 def _appendix(export: ExportResult, styles: dict[str, ParagraphStyle]) -> list[Any]:
     text = (
-        f"Grundlage dieses Berichts sind {export.probe_cycles} Prüfrunden und {export.outages} Ausfälle in der Datei "
-        "<b>rohdaten.jsonl</b>. Die Prüfsumme zeigt, dass diese Datei seit der Erstellung des Berichts unverändert ist. "
-        "Sie belegt nicht, wer die Daten erzeugt hat."
+        f"Grundlage dieses Berichts sind {export.probe_cycles} Prüfrunden und {export.outages} Ereignisse in der Datei "
+        "<b>rohdaten.jsonl</b>. Sie liegt auf dem Messgerät im Ordner des Berichts und kann auf Wunsch nachgereicht "
+        "werden. Die Prüfsumme zeigt, dass diese Datei seit der Erstellung des Berichts unverändert ist. Sie belegt "
+        "nicht, wer die Daten erzeugt hat."
     )
     return [
-        Paragraph("Anhang: Prüfsumme der Rohdaten", styles["h1"]),
+        Paragraph("A5 Prüfsumme der Rohdaten", styles["h1"]),
         Paragraph(text, styles["body"]),
         Paragraph("SHA-256 von rohdaten.jsonl:", styles["h2"]),
         Paragraph(export.raw_sha256, styles["mono"]),
@@ -370,26 +571,52 @@ def _appendix(export: ExportResult, styles: dict[str, ParagraphStyle]) -> list[A
     ]
 
 
+def _appendix_intro(styles: dict[str, ParagraphStyle]) -> list[Any]:
+    text = ("Dieser Teil richtet sich an Netzwerktechniker. Er beschreibt die Messmethode, die Qualität jeder "
+            "geprüften Strecke und alle übrigen Ereignisse. Für die Aussage über die Ausfälle der Leitung reichen "
+            "die vorderen Seiten.")
+    return [PageBreak(), Paragraph("Technischer Anhang", styles["appendix"]), Paragraph(text, styles["body"])]
+
+
 def build_report(config: Config, store: Store, start: datetime, end: datetime, directory: Path) -> ReportResult:
+    with _BUILD_LOCK:
+        return _build(config, store, start, end, directory)
+
+
+def _build(config: Config, store: Store, start: datetime, end: datetime, directory: Path) -> ReportResult:
     _register_fonts()
     styles = _styles()
     zone = config.zone
     directory.mkdir(parents=True, exist_ok=True)
     created = now_utc()
+    # Liegt das Ende in der Zukunft (z. B. „bis heute“), enden die Zeiträume jetzt: Sonst zählten die
+    # noch nicht vergangenen Stunden als Messlücke und „letzte 24 Stunden“ wären die falschen.
+    effective_end = max(min(end, created), start + timedelta(seconds=1))
 
-    samples = load_samples(store, start, end)
-    outages = load_outages(store, start, end)
-    coverage: Coverage = load_coverage(store, start, end, monitor_gap_threshold(config.reachability.interval_s), zone)
-    summary = compute_summary(samples, outages, coverage, start, end, zone)
-    sessions = store.sessions(start, end)
-    export = export_range(store, start, end, directory / "rohdaten")
-    pngs = render_all(PlotContext(samples, outages, coverage, start, end, zone), directory / "abbildungen")
+    threshold = monitor_gap_threshold(config.reachability.interval_s)
+    samples = load_samples(store, start, effective_end)
+    outages = load_outages(store, start, effective_end)
+    stamps = [parse_iso(stamp) for stamp in store.cycle_times(start, effective_end)]
+    coverage: Coverage = compute_coverage(stamps, start, effective_end, threshold, zone)
+    summary = compute_summary(samples, outages, coverage, start, effective_end, zone)
+    sessions = store.sessions(start, effective_end)
+    export = export_range(store, start, effective_end, directory / "rohdaten")
+    pngs = render_all(PlotContext(samples, outages, coverage, start, effective_end, zone), directory / "abbildungen")
+    line = LineStatistics(outages, stamps, threshold, zone)
+    total = line.period("Gesamter Zeitraum", start, effective_end)
 
     story: list[Any] = []
-    story += _intro(config, summary, styles, created)
-    story += _key_figures(summary, styles)
+    story += _intro(config, summary, styles, created, effective_end)
+    story += [Spacer(1, 8), Paragraph(" ".join(summary_sentences(total, config)), styles["body"])]
+    story += _headline(total, styles)
     story += _warnings_block(collect_warnings(summary, sessions, outages), styles)
+    story += _period_section(line, start, effective_end, config, styles)
+    story += _main_figure(pngs, styles)
+    story += _pattern_section(line, styles)
+    story += _days_section(line, config, styles)
+    story += _line_list(line, config, styles)
     story += _legal_note(styles)
+    story += _appendix_intro(styles)
     story += _methodology(config, sessions, styles)
     story += _metrics(summary, styles)
     story += _outage_table(outages, config, styles)
@@ -400,7 +627,7 @@ def build_report(config: Config, store: Store, start: datetime, end: datetime, d
     document = SimpleDocTemplate(
         str(pdf_path), pagesize=A4, leftMargin=1.8 * cm, rightMargin=1.8 * cm, topMargin=1.7 * cm,
         bottomMargin=1.7 * cm, title=TITLE, author=config.report.customer_name or "linkmon",
-        subject=f"Messzeitraum {start.isoformat()} bis {end.isoformat()}",
+        subject=f"Messzeitraum {start.isoformat()} bis {effective_end.isoformat()}",
     )
     document.build(story, onFirstPage=_footer, onLaterPages=_footer)
     return ReportResult(pdf_path, directory, export, summary)

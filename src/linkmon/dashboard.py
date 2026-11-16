@@ -6,12 +6,13 @@ import json
 import logging
 import threading
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import plotly.graph_objects as go
-from dash import Dash, Input, Output, dash_table, dcc, html
+from dash import Dash, Input, Output, State, dash_table, dcc, html, no_update
 from plotly.subplots import make_subplots
 
 from linkmon.config import Config
@@ -343,6 +344,43 @@ def _range_bounds(choice: str, custom_start: str | None, custom_end: str | None,
     return datetime(2000, 1, 1, tzinfo=UTC), finish
 
 
+def report_bounds(config: Config, store: Store, choice: str, custom_start: str | None, custom_end: str | None,
+                  now: datetime) -> tuple[datetime, datetime]:
+    """Zeitraum des Berichts zur Auswahl im Webinterface.
+
+    „Alles“ beginnt am Tag der ersten Prüfung statt im Jahr 2000, und kein Bericht reicht in die Zukunft.
+    """
+    start, end = _range_bounds(choice, custom_start, custom_end, config.zone, now)
+    earliest = store.first_cycle_time()
+    if earliest and choice == "all":
+        local = parse_iso(earliest).astimezone(config.zone)
+        start = max(start, local.replace(hour=0, minute=0, second=0, microsecond=0))
+    end = min(end, now)
+    if end <= start:
+        start = end - timedelta(hours=1)
+    return start, end
+
+
+def report_filename(start: datetime, end: datetime, zone: ZoneInfo) -> str:
+    last = (end - timedelta(seconds=1)).astimezone(zone)
+    return f"stoerungsprotokoll_{start.astimezone(zone):%Y-%m-%d}_bis_{last:%Y-%m-%d}.pdf"
+
+
+def create_report_file(config: Config, choice: str, custom_start: str | None, custom_end: str | None,
+                       now: datetime) -> tuple[Path, str]:
+    """Baut den Bericht wie „linkmon report“ und gibt PDF-Pfad und Dateinamen für den Download zurück.
+
+    Alles bleibt zusätzlich auf dem Messgerät unter data/berichte, samt Abbildungen und Rohdaten mit Prüfsumme.
+    """
+    from linkmon.report import build_report  # Erst beim Klick laden: reportlab braucht sonst unnötig Speicher.
+
+    store = Store(config.store_dir, readonly=True)
+    start, end = report_bounds(config, store, choice, custom_start, custom_end, now)
+    stamp = now.astimezone(config.zone).strftime("%Y%m%d_%H%M%S")
+    result = build_report(config, store, start, end, config.data_dir / "berichte" / f"bericht_{stamp}")
+    return result.pdf, report_filename(start, end, config.zone)
+
+
 CHECK_LABELS = {"lan": "Heimnetz", "isp": "Provider-Hop", "ext": "Internet", "dns": "DNS",
                 "dnshome": "DNS Heimnetz (Pi-hole)", "dnsref": "DNS öffentlich", "https": "HTTPS",
                 "interface": "Netzwerkkarte"}
@@ -616,6 +654,12 @@ def create_app(config: Config) -> Dash:
                          id="dates-wrap", className="dates-wrap", style={"display": "none"}),
                 _segmented("range", DEFAULT_RANGE, [("6 Std.", "6h"), ("24 Std.", "24h"), ("7 Tage", "7d"),
                                                     ("30 Tage", "30d"), ("Alles", "all"), ("Von/bis", "custom")]),
+                html.Button([html.Span("↓", className="button-icon", **{"aria-hidden": "true"}), "PDF-Bericht"],
+                            id="report-button", className="button", n_clicks=0,
+                            title="Störungsprotokoll für den gewählten Zeitraum herunterladen"),
+                dcc.Loading(html.Div(id="report-status", className="report-status", role="status"), type="dot",
+                            color="#3987e5", delay_show=150),
+                dcc.Download(id="report-download"),
             ], className="controls"),
         ], className="topbar"),
         html.Div(id="overview"),
@@ -678,5 +722,25 @@ def create_app(config: Config) -> Dash:
         heatmap = build_heatmap(view["samples"], view["start"], view["end"], zone, heat)
         rows = filter_rows(table_rows(view["outages"], view["gaps"], zone), table_filter)
         return figure, heatmap, overview, track_table(view["stats"], view["samples"]), rows, f"{len(rows)} Einträge"
+
+    @app.callback(
+        Output("report-download", "data"), Output("report-status", "children"),
+        Input("report-button", "n_clicks"), State("range", "value"), State("dates", "start_date"),
+        State("dates", "end_date"), prevent_initial_call=True,
+    )
+    def download_report(clicks: int, choice: str, custom_start: str | None,
+                        custom_end: str | None) -> tuple[Any, str]:
+        if not clicks:
+            return no_update, ""
+        if not Store.exists(config.store_dir):
+            return no_update, "Noch keine Daten für einen Bericht"
+        if choice == "custom" and not (custom_start and custom_end):
+            return no_update, "Bitte zuerst Von und Bis wählen"
+        try:
+            pdf, filename = create_report_file(config, choice, custom_start, custom_end, now_utc())
+        except Exception:  # Ein Fehler im Bericht darf das Webinterface nicht lahmlegen.
+            logging.getLogger(__name__).exception("PDF-Bericht fehlgeschlagen")
+            return no_update, "Bericht fehlgeschlagen, Details im Log"
+        return dcc.send_file(str(pdf), filename=filename), f"Gespeichert: {filename}"
 
     return app

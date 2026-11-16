@@ -59,6 +59,7 @@ class Dashboard:
 
 @dataclass(frozen=True)
 class Report:
+    provider: str = "Vodafone"     # Name des Anbieters in Überschriften und Erklärungen des Berichts
     tariff: str = ""
     customer_name: str = ""
     customer_number: str = ""
