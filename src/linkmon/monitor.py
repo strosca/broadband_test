@@ -207,8 +207,11 @@ class Monitor:
                  route_refresher: Callable[[], bool] | None = None,
                  route_stale: Callable[[], bool] | None = None,
                  host_info: HostInfoCollector = hostinfo.collect_host_info,
-                 clock: Callable[[], datetime] = now_utc) -> None:
+                 clock: Callable[[], datetime] = now_utc, backfill: bool | None = None) -> None:
         self._config = config
+        # Der Nachtrag alter Aussetzer läuft nur im echten Betrieb, nicht mit eingespielten Testrunden.
+        self._backfill = probe_runner is None if backfill is None else backfill
+        self._backfill_thread: threading.Thread | None = None
         self._db = store
         self._stop = threading.Event()
         self._clock = clock
@@ -244,6 +247,10 @@ class Monitor:
         if recovered:
             log.warning("%d offene Ausfälle nach unsauberem Ende als unbestätigt geschlossen", recovered)
         self._start_session(now, self._host_info())
+        if self._backfill:
+            self._backfill_thread = threading.Thread(target=self._run_backfill, args=(now,), name="nachtrag",
+                                                     daemon=True)
+            self._backfill_thread.start()
 
         reason = "regulär beendet"
         try:
@@ -258,6 +265,16 @@ class Monitor:
             self._apply(self._tracker.interrupt(end))
             self._db.end_session(self._session_id, end, reason)
             log.info("Sitzung %d beendet: %s", self._session_id, reason)
+
+    def _run_backfill(self, before: datetime) -> None:
+        """Trägt kurze Aussetzer aus älteren Messungen einmalig nach, neben der laufenden Messung."""
+        from linkmon.backfill import backfill_dropouts
+
+        try:
+            backfill_dropouts(self._db, monitor_gap_threshold(self._config.reachability.interval_s), before,
+                              self._config.data_dir / "archiv")
+        except Exception:  # Der Nachtrag darf die Messung nie stören. Beim nächsten Start neuer Versuch.
+            log.exception("Nachtrag kurzer Aussetzer fehlgeschlagen")
 
     def _start_session(self, now: datetime, info: HostInfo) -> None:
         self._session_id = self._db.start_session(

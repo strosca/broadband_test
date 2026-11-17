@@ -504,6 +504,23 @@ class Store:
             self._save(OUTAGES_FILE)
             return outage_id
 
+    def add_closed_outages(self, items: list[tuple[int | None, str, str, datetime, datetime, bool]]) -> int:
+        """Trägt bereits beendete Ausfälle nach: (Sitzung, Ebene, Befund, Start, Ende, Ende bestätigt).
+
+        Die Datei wird wie immer einmal komplett und atomar neu geschrieben. Gibt die Zahl neuer Einträge zurück.
+        """
+        self._require_writable()
+        if not items:
+            return 0
+        with self._lock:
+            next_id = max((row["id"] for row in self._outages), default=0) + 1
+            for offset, (session_id, level, detail, start, end, confirmed) in enumerate(items):
+                self._outages.append({"id": next_id + offset, "session_id": session_id, "level": level,
+                                      "detail": detail, "start_utc": iso_utc(start), "end_utc": iso_utc(end),
+                                      "end_confirmed": int(confirmed)})
+            self._save(OUTAGES_FILE)
+            return len(items)
+
     def close_outage(self, level: str, end: datetime, confirmed: bool) -> None:
         self._require_writable()
         with self._lock:
