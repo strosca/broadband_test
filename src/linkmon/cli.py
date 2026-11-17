@@ -1,4 +1,4 @@
-"""Kommandozeile: linkmon run | dashboard | report | export | clear | status."""
+"""Kommandozeile: linkmon run | dashboard | report | export | clear | reanalyse | status."""
 
 from __future__ import annotations
 
@@ -241,6 +241,67 @@ def _cmd_clear(config: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+REANALYSE_WAIT_S = 60
+
+
+def _cmd_reanalyse(config: Config, args: argparse.Namespace) -> int:
+    """Sucht kurze Leitungsaussetzer in den Prüfrunden und trägt fehlende in die Ausfallliste ein."""
+    from linkmon import backfill, clearing
+    from linkmon.monitor import monitor_gap_threshold
+
+    if not Store.exists(config.store_dir):
+        print("Keine Messdaten vorhanden, nichts zu prüfen.")
+        return 0
+    zone = config.zone
+    start = parse_user_time(args.date_from, zone) if args.date_from else None
+    before = now_utc()
+    store = _open_store(config)
+    print(f"Messdaten: {config.store_dir}")
+    print("Suche kurze Leitungsaussetzer, die noch nicht in der Ausfallliste stehen ...")
+
+    def progress(path: Path, count: int) -> None:
+        print(f"  {path.name}: {count} gefunden", flush=True)
+
+    found = backfill.find_missing_dropouts(store, monitor_gap_threshold(config.reachability.interval_s), start,
+                                           before, progress)
+    if not found:
+        print("Nichts nachzutragen, die Ausfallliste ist vollständig.")
+        return 0
+    total = sum(item.duration_s for item in found)
+    print(f"Gefunden: {len(found)} kurze Aussetzer, zusammen {total:.0f} s.")
+    if args.dry_run:
+        print("Probelauf (--dry-run): nichts eingetragen.")
+        return 0
+
+    lock = _lock(config)
+    if lock.acquire():
+        try:
+            writable = Store(config.store_dir)
+            try:
+                added = backfill.apply_dropouts(writable, found, config.data_dir / clearing.ARCHIVE_DIR, before)
+            finally:
+                writable.close()
+        finally:
+            lock.release()
+        print(f"{added} Aussetzer in die Ausfallliste eingetragen. Sicherung der alten Liste unter "
+              f"{config.data_dir / clearing.ARCHIVE_DIR}.")
+        return 0
+
+    # Der Messdienst läuft: Er trägt die Funde vor der nächsten Prüfrunde selbst ein.
+    backfill.write_request(config.data_dir, found)
+    print("Der Messdienst läuft und trägt die Funde vor der nächsten Prüfrunde ein ...")
+    result = backfill.wait_for_result(config.data_dir, REANALYSE_WAIT_S)
+    if result is None:
+        (config.data_dir / backfill.REQUEST_FILE).unlink(missing_ok=True)
+        print(f"Fehler: Der Messdienst hat in {REANALYSE_WAIT_S} s nicht reagiert. Nichts geändert.", file=sys.stderr)
+        return 2
+    if not result.get("ok"):
+        print(f"Fehler: {result.get('message')}", file=sys.stderr)
+        return 2
+    print(f"{result.get('added', 0)} Aussetzer in die Ausfallliste eingetragen. Die Messung läuft weiter.")
+    return 0
+
+
 def _percent(value: float | None, digits: int) -> str:
     return "-" if value is None else f"{value:.{digits}f} %".replace(".", ",")
 
@@ -317,6 +378,12 @@ def build_parser() -> argparse.ArgumentParser:
     clear.add_argument("--delete", action="store_true", help="Endgültig löschen statt nach data/archiv verschieben")
     clear.add_argument("--yes", "-y", action="store_true", help="Ohne Rückfrage")
     clear.set_defaults(handler=_cmd_clear)
+
+    reanalyse = commands.add_parser("reanalyse", help="Kurze Aussetzer aus den Prüfrunden in die Ausfallliste "
+                                                      "nachtragen")
+    reanalyse.add_argument("--from", dest="date_from", help="Nur ab diesem Tag suchen, z. B. 2026-11-01")
+    reanalyse.add_argument("--dry-run", action="store_true", help="Nur suchen und zählen, nichts eintragen")
+    reanalyse.set_defaults(handler=_cmd_reanalyse)
 
     commands.add_parser("status", help="Konfiguration und letzten Stand anzeigen").set_defaults(handler=_cmd_status)
     return parser

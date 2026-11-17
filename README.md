@@ -210,11 +210,20 @@ einzelner Dienste (DNS, HTTPS) brauchen mindestens 3 Runden in Folge, weil sie a
 können. Start ist die erste fehlerhafte Runde, Ende die erste fehlerfreie.
 
 Ältere Versionen warteten auch bei der Leitung 3 Runden ab. Kürzere Aussetzer aus dieser Zeit stehen nur in den
-Prüfrunden. Beim ersten Start einer neueren Version trägt der Messdienst sie einmalig in `ausfaelle.csv` nach, im
-Hintergrund und ohne die Messung zu unterbrechen (Befund „Kurzer Aussetzer, nachträglich aus den Prüfrunden
-ermittelt“). Vorher sichert er die Ausfallliste unter `data/archiv/ausfaelle_vor_nachtrag_<Zeit>.csv`, danach steht der
-Vermerk `nachtrag_kurze_aussetzer` in `zustand.csv`. Die Prüfrunden bleiben unverändert. Bis der Nachtrag gelaufen ist,
-ermitteln Webinterface und Bericht dieselben Aussetzer bei der Anzeige. Die Verfügbarkeit zählt nur die Ebene Leitung und bezieht sie auf die
+Prüfrunden. Webinterface und Bericht ermitteln sie bei der Anzeige mit. Damit sie auch fest in `ausfaelle.csv` stehen
+(und damit in `linkmon export`), gibt es einen eigenen Befehl:
+
+```sh
+linkmon reanalyse              # alle Messdaten durchsuchen und fehlende Aussetzer eintragen
+linkmon reanalyse --dry-run    # nur zählen, nichts ändern
+linkmon reanalyse --from 2026-11-01
+```
+
+Der Befehl sucht als eigener Prozess und nur lesend, eine Monatsdatei nach der anderen. Läuft der Messdienst, übergibt
+er ihm die Funde, und der Dienst trägt sie vor der nächsten Prüfrunde ein, ohne Messlücke. Vorher wird die Ausfallliste
+unter `data/archiv/ausfaelle_vor_nachtrag_<Zeit>.csv` gesichert. Die Prüfrunden bleiben unverändert, und mehrfaches
+Ausführen trägt nichts doppelt ein. Neu eingetragene Aussetzer haben den Befund „Kurzer Aussetzer, nachträglich aus den
+Prüfrunden ermittelt“. Die Verfügbarkeit zählt nur die Ebene Leitung und bezieht sie auf die
 tatsächlich überwachte Zeit.
 
 **Kennzahlen der Verbindungsqualität:** Ping ist die Antwortzeit eines Pings, für „Internet“ aus beiden externen Zielen

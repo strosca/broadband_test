@@ -11,6 +11,7 @@ import io
 import json
 import math
 import threading
+import warnings
 from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -111,8 +112,12 @@ def compact_frame(text: str, header: list[str]) -> pd.DataFrame:
     # dürfen kürzer sein als die Kopfzeile, pandas füllt sie dann leer auf.
     options: dict[str, Any] = {"header": None, "names": header, "index_col": False, "on_bad_lines": "skip"}
     cells = pd.read_csv(io.StringIO(text), dtype=str, keep_default_na=False, na_filter=False, **options)
-    numbers = pd.read_csv(io.StringIO(text), dtype={"zeit_utc": str, "ebene": str}, keep_default_na=False,
-                          na_values=["", cyclefile.OK_TEXT, cyclefile.FAIL_TEXT], **options)
+    with warnings.catch_warnings():
+        # Fehlergründe wie "x:Timeout" mischen Text in Zahlenspalten. pandas warnt dann; die Spalte wird unten
+        # ohnehin mit to_numeric umgewandelt, die Warnung sagt also nichts Neues.
+        warnings.simplefilter("ignore", pd.errors.DtypeWarning)
+        numbers = pd.read_csv(io.StringIO(text), dtype={"zeit_utc": str, "ebene": str}, keep_default_na=False,
+                              na_values=["", cyclefile.OK_TEXT, cyclefile.FAIL_TEXT], **options)
     stamps = pd.to_datetime(cells["zeit_utc"], format="%Y-%m-%d %H:%M:%S", utc=True, errors="coerce")
     valid = stamps.notna().to_numpy()
     data: dict[str, Any] = {"ts": stamps[valid].reset_index(drop=True)}
