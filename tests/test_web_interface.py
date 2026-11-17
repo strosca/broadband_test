@@ -119,3 +119,32 @@ def test_overview_shows_live_state_ping_and_wlan_hint(config, store: Store) -> N
     assert "35 ms" in text  # Mittel der beiden externen Ziele in der letzten Runde
     assert "WLAN, 585 Mbit/s" in text and "per Kabel" in text
     assert "Noch keiner" in text
+
+
+def test_live_signature_changes_only_when_the_state_changes(config, store: Store) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from conftest import results, session
+
+    from linkmon.dashboard import create_app, live_signature
+
+    start = datetime(2026, 11, 17, tzinfo=UTC)
+    session_id = session(store, start)
+    store.add_cycle(session_id, start, None, results())
+    reader = lambda: live_signature(Store(config.store_dir, readonly=True))  # noqa: E731
+    calm = reader()
+    store.add_cycle(session_id, start + timedelta(seconds=3), None, results())
+    assert reader() == calm  # Nur eine neue gute Runde: kein Neuaufbau
+    store.add_cycle(session_id, start + timedelta(seconds=6), "line", results(isp=None, ext_a=None, ext_b=None))
+    failing = reader()
+    assert failing != calm
+    store.open_outage(session_id, "line", "Erster Provider-Hop und externe Ziele nicht erreichbar",
+                      start + timedelta(seconds=6))
+    logged = reader()
+    assert logged != failing
+    store.add_cycle(session_id, start + timedelta(seconds=9), None, results())
+    store.close_outage("line", start + timedelta(seconds=9), True)
+    assert reader() not in (logged, failing, calm)  # Verbindung zurück, ein Ausfall mehr als vorher
+
+    app = create_app(config)
+    assert any("live-state.data" in key for key in app.callback_map)

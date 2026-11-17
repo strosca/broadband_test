@@ -64,6 +64,9 @@ HEAT_LOSS = "loss_pct"
 HEAT_PING = "p95"
 KIND_OUTAGE = "Ausfall"
 KIND_GAP = "Messlücke"
+# Die Live-Prüfung liest nur das Ende der Messdatei und die kleine Ausfalldatei. Sie läuft deshalb
+# jede Sekunde, die ganze Seite wird aber nur neu berechnet, wenn sich der Zustand ändert.
+LIVE_POLL_MS = 1000
 _CACHE = SampleCache()
 
 
@@ -402,6 +405,23 @@ def current_condition(last_results: str | None, open_levels: list[str]) -> tuple
     return ("Prüfung gestört" if failed else "Alles in Ordnung"), note
 
 
+def live_signature(store: Store) -> str:
+    """Fingerabdruck des aktuellen Zustands: gestörte Prüfungen, offene Ausfälle, Zahl der Ausfälle.
+
+    Bleibt er gleich, passiert nichts. Ändert er sich (Störung beginnt, Ausfall wird geloggt, Verbindung ist
+    zurück), baut die Seite sofort neu auf, statt bis zur nächsten regulären Aktualisierung zu warten.
+    """
+    newest = store.latest_cycle()
+    failed: list[str] = []
+    if newest and newest.get("results"):
+        results: dict[str, list[Any]] = json.loads(newest["results"])
+        results.pop(LEGACY_SPEEDTEST_MARKER, None)
+        failed = sorted(name for name, item in results.items() if not item[0])
+    outages = store.outages()
+    open_ids = [row["id"] for row in outages if row["end_utc"] is None]
+    return json.dumps([failed, open_ids, len(outages)])
+
+
 def condition_tone(condition: str) -> tuple[str, str]:
     """Liefert CSS-Ton und Symbol: Der Zustand ist nie allein an der Farbe erkennbar."""
     if condition == "Alles in Ordnung":
@@ -695,20 +715,33 @@ def create_app(config: Config) -> Dash:
             html.Div(_table(), className="table-wrap"),
         ], className="card table-card"),
         dcc.Interval(id="tick", interval=config.dashboard.refresh_s * 1000),
+        dcc.Interval(id="live", interval=LIVE_POLL_MS),
+        dcc.Store(id="live-state"),
     ], className="shell")
 
     @app.callback(Output("dates-wrap", "style"), Input("range", "value"))
     def toggle_dates(choice: str) -> dict[str, str]:
         return {"display": "block"} if choice == "custom" else {"display": "none"}
 
+    @app.callback(Output("live-state", "data"), Input("live", "n_intervals"), State("live-state", "data"))
+    def watch(_pulse: int | None, previous: str | None) -> Any:
+        if not Store.exists(config.store_dir):
+            return no_update
+        try:
+            current = live_signature(Store(config.store_dir, readonly=True))
+        except (OSError, ValueError):  # Datei wird gerade geschrieben: beim nächsten Puls erneut.
+            return no_update
+        return no_update if current == previous else current
+
     @app.callback(
         Output("chart", "figure"), Output("heatmap", "figure"), Output("overview", "children"),
         Output("tracks", "children"), Output("table", "data"), Output("table-count", "children"),
-        Input("tick", "n_intervals"), Input("range", "value"), Input("dates", "start_date"),
-        Input("dates", "end_date"), Input("options", "value"), Input("heat", "value"), Input("table-filter", "value"),
+        Input("tick", "n_intervals"), Input("live-state", "data"), Input("range", "value"),
+        Input("dates", "start_date"), Input("dates", "end_date"), Input("options", "value"), Input("heat", "value"),
+        Input("table-filter", "value"),
     )
-    def refresh(_tick: int | None, choice: str, custom_start: str | None, custom_end: str | None, options: list[str],
-                heat: str, table_filter: str) -> tuple[Any, ...]:
+    def refresh(_tick: int | None, _live: str | None, choice: str, custom_start: str | None, custom_end: str | None,
+                options: list[str], heat: str, table_filter: str) -> tuple[Any, ...]:
         if not Store.exists(config.store_dir):
             message = "Noch keine Daten. Starte die Messung mit: linkmon run"
             return empty_figure(message), empty_figure(message, height=360), [], [], [], ""

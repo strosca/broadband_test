@@ -110,6 +110,12 @@ das). Der Messdienst muss dafür **nicht** angehalten werden: Läuft er, leert e
 Prüfrunde und misst ohne Lücke weiter. Erhalten bleiben die ermittelte Route, die Konfiguration und das Textlog unter
 `data/logs`. Archivierte Daten lassen sich ansehen, indem man den Ordner zurück nach `data/messdaten` verschiebt.
 
+## Webinterface live
+
+Das Webinterface prüft jede Sekunde den letzten Stand (nur das Ende der Messdatei und die Ausfallliste). Beginnt eine
+Störung, wird ein Ausfall geloggt oder ist die Verbindung zurück, baut sich die Seite sofort neu auf. Alles andere
+aktualisiert sich wie bisher alle `refresh_s` Sekunden.
+
 ## Auswerten
 
 | Befehl | Ergebnis |
