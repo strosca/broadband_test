@@ -108,15 +108,24 @@ class OutageClosed:
 OutageEvent = OutageOpened | OutageClosed
 
 
+# Ebenen, bei denen keine Verbindung besteht. Hier zählt schon ein kurzer Aussetzer: Genau die stören Streams.
+CONNECTIVITY_LEVELS = frozenset({Level.LINE, Level.ROUTER, Level.LOCAL})
+# Einzelne Dienste (DNS, HTTPS) scheitern auch mal an einer langsamen Antwort. Für sie, und für den Wechsel der
+# Ebene während eines laufenden Ausfalls, braucht es mindestens so viele Runden in Folge.
+STABLE_ROUNDS = 3
+
+
 class OutageTracker:
     """Macht aus einzelnen Prüfrunden Ausfälle mit Start, Ende und Ebene.
 
     Start ist die erste fehlerhafte Runde, Ende die erste fehlerfreie: Die Schwellwerte
-    verhindern Fehlalarme, verfälschen aber die Dauer nicht.
+    verhindern Fehlalarme, verfälschen aber die Dauer nicht. failure_threshold gilt für fehlende
+    Verbindung (Leitung, Router, Lokal). DNS- und HTTPS-Störungen brauchen mindestens STABLE_ROUNDS.
     """
 
     def __init__(self, failure_threshold: int, recovery_threshold: int) -> None:
         self._failure_threshold = failure_threshold
+        self._stable_rounds = max(failure_threshold, STABLE_ROUNDS)
         self._recovery_threshold = recovery_threshold
         self._current: Level | None = None
         self._fault_run: list[tuple[datetime, Level, str]] = []
@@ -154,22 +163,25 @@ class OutageTracker:
 
         self._fault_run.append((moment, level, detail))
         if self._current is None:
-            if len(self._fault_run) < self._failure_threshold:
-                return []
-            return [self._open_from_run(self._dominant_level())]
+            connectivity = [item[1] for item in self._fault_run if item[1] in CONNECTIVITY_LEVELS]
+            if len(connectivity) >= self._failure_threshold:
+                return [self._open_from_run(self._dominant_level(CONNECTIVITY_LEVELS))]
+            if len(self._fault_run) >= self._stable_rounds:
+                return [self._open_from_run(self._dominant_level())]
+            return []
 
         # Ebenenwechsel während eines Ausfalls erst nach stabilen Runden derselben Ebene.
-        recent = self._fault_run[-self._failure_threshold :]
-        if len(recent) < self._failure_threshold or any(item[1] != level for item in recent):
+        recent = self._fault_run[-self._stable_rounds :]
+        if len(recent) < self._stable_rounds or any(item[1] != level for item in recent):
             return []
         self._fault_run = recent
         closed = OutageClosed(self._current, recent[0][0], confirmed=True)
         return [closed, self._open_from_run(level)]
 
-    def _dominant_level(self) -> Level:
-        counts = Counter(item[1] for item in self._fault_run)
+    def _dominant_level(self, among: frozenset[Level] | None = None) -> Level:
+        counts = Counter(item[1] for item in self._fault_run if among is None or item[1] in among)
         highest = max(counts.values())
-        return next(item[1] for item in reversed(self._fault_run) if counts[item[1]] == highest)
+        return next(item[1] for item in reversed(self._fault_run) if counts.get(item[1]) == highest)
 
     def _open_from_run(self, level: Level) -> OutageOpened:
         start = self._fault_run[0][0]

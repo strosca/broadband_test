@@ -148,3 +148,24 @@ def test_interrupt_discards_pending_faults() -> None:
     feed(tracker, [FAULT, FAULT])
     assert tracker.interrupt(T0) == []
     assert feed(tracker, [FAULT]) == []
+
+
+def test_threshold_one_logs_a_single_dropout_of_the_line() -> None:
+    tracker = OutageTracker(1, 2)
+    events = feed(tracker, [OK, FAULT, OK, OK])
+    assert events == [OutageOpened(Level.LINE, "Leitung", T0 + timedelta(seconds=3)),
+                      OutageClosed(Level.LINE, T0 + timedelta(seconds=6), confirmed=True)]
+
+
+def test_threshold_one_still_needs_three_rounds_for_dns() -> None:
+    tracker = OutageTracker(1, 2)
+    dns = Classification(Level.DNS, "DNS")
+    assert feed(tracker, [dns, dns, OK]) == []
+    assert feed(tracker, [dns, dns, dns], start=3) == [OutageOpened(Level.DNS, "DNS", T0 + timedelta(seconds=9))]
+
+
+def test_threshold_one_does_not_flip_levels_on_a_single_round() -> None:
+    tracker = OutageTracker(1, 2)
+    router = Classification(Level.ROUTER, "Router")
+    events = feed(tracker, [FAULT, router, FAULT])
+    assert len(events) == 1 and tracker.current == Level.LINE

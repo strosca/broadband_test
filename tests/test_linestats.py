@@ -147,3 +147,51 @@ def test_interval_comes_from_the_data_not_the_config(config: Config) -> None:
     stats = _stats([], start, start + timedelta(days=1))
     text = " ".join(summary_sentences(stats.period("Gesamt", start, start + timedelta(days=1)), config, 30.0))
     assert "alle 30 Sekunden" in text and "ab etwa 90 Sekunden" in text
+
+
+def _round_store(config: Config, store: Store, pattern: str) -> tuple[datetime, list]:
+    """Eine Prüfrunde je 3 s. „x“: Leitung weg (Router da, Internet nicht), „r“: Router weg, „.“: alles gut."""
+    from conftest import results, session
+
+    from linkmon.quality import load_samples
+
+    start = datetime(2026, 11, 5, 20, tzinfo=ZONE)
+    session_id = session(store, start)
+    for index, mark in enumerate(pattern):
+        if mark == "x":
+            values = results(isp=None, ext_a=None, ext_b=None)
+        elif mark == "r":
+            values = results(lan=None, isp=None, ext_a=None, ext_b=None)
+        else:
+            values = results()
+        store.add_cycle(session_id, start + timedelta(seconds=3 * index), None, values)
+    end = start + timedelta(seconds=3 * len(pattern))
+    return start, load_samples(store, start, end)
+
+
+def test_dropouts_are_reconstructed_from_stored_rounds(config: Config, store: Store) -> None:
+    from linkmon.linestats import DROPOUT_DETAIL, dropouts_from_samples
+
+    start, samples = _round_store(config, store, "..x...xx..r..x")
+    found = dropouts_from_samples(samples, [], 9)
+    assert [(item.start - start).total_seconds() for item in found] == [6, 18, 39]
+    assert [item.duration_s for item in found] == [3, 6, 3]
+    assert [item.confirmed for item in found] == [True, True, False]  # Danach keine Runde mehr
+    assert all(item.level == "line" and item.detail == DROPOUT_DETAIL for item in found)
+
+
+def test_dropouts_inside_logged_outages_are_not_counted_twice(config: Config, store: Store) -> None:
+    from linkmon.linestats import dropouts_from_samples
+
+    start, samples = _round_store(config, store, "..xxx...x..")
+    logged = [_line(start + timedelta(seconds=6), 9)]
+    found = dropouts_from_samples(samples, logged, 9)
+    assert [(item.start - start).total_seconds() for item in found] == [24]
+
+
+def test_default_logs_every_dropout(tmp_path: Path) -> None:
+    from linkmon.config import load_config
+
+    path = tmp_path / "config.toml"
+    path.write_text("", encoding="utf-8")
+    assert load_config(path).reachability.failure_threshold == 1

@@ -198,8 +198,14 @@ Kabel an der Vodafone Station (192.168.0.x), steht der Pi-hole vom WLAN noch in 
 linkmon nutzt deshalb private DNS-Server nur, wenn sie in einem Subnetz eines verbundenen Adapters liegen. Welche
 Server gerade gelten, steht bei jedem Wechsel im Log („DNS-Server: …“) und in `linkmon status`.
 
-Standardmäßig eröffnen 3 fehlerhafte Runden in Folge einen Ausfall, 2 fehlerfreie beenden ihn. Start ist die erste
-fehlerhafte Runde, Ende die erste fehlerfreie. Die Verfügbarkeit zählt nur die Ebene Leitung und bezieht sie auf die
+Standardmäßig eröffnet schon eine einzige fehlerhafte Runde einen Ausfall der Verbindung (Leitung, Router, Lokal),
+2 fehlerfreie beenden ihn. So zählt auch ein Aussetzer von wenigen Sekunden, wie er Streams stocken lässt. Störungen
+einzelner Dienste (DNS, HTTPS) brauchen mindestens 3 Runden in Folge, weil sie auch an einer langsamen Antwort scheitern
+können. Start ist die erste fehlerhafte Runde, Ende die erste fehlerfreie.
+
+Ältere Versionen warteten auch bei der Leitung 3 Runden ab. Kürzere Aussetzer aus dieser Zeit trägt linkmon in
+Webinterface und Bericht nachträglich aus den gespeicherten Prüfrunden nach (Befund „Kurzer Aussetzer, nachträglich aus
+den Prüfrunden ermittelt“). Die Messdaten selbst bleiben unverändert. Die Verfügbarkeit zählt nur die Ebene Leitung und bezieht sie auf die
 tatsächlich überwachte Zeit.
 
 **Kennzahlen der Verbindungsqualität:** Ping ist die Antwortzeit eines Pings, für „Internet“ aus beiden externen Zielen

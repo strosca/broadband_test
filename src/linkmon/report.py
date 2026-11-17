@@ -30,10 +30,18 @@ from reportlab.platypus import (
 )
 
 from linkmon import __version__
+from linkmon.classify import STABLE_ROUNDS
 from linkmon.config import Config
 from linkmon.export import ExportResult, export_range
 from linkmon.levels import LEVEL_LABELS, LEVEL_ORDER, Level
-from linkmon.linestats import ClassRow, LineStatistics, PeriodStats, measured_interval, plain_duration
+from linkmon.linestats import (
+    ClassRow,
+    LineStatistics,
+    PeriodStats,
+    dropouts_from_samples,
+    measured_interval,
+    plain_duration,
+)
 from linkmon.monitor import monitor_gap_threshold
 from linkmon.plots import MAIN_FIGURE, PlotContext, render_all
 from linkmon.quality import load_samples
@@ -413,6 +421,18 @@ def _warnings_block(warnings: list[str], styles: dict[str, ParagraphStyle]) -> l
     return [Spacer(1, 8), table]
 
 
+def _rounds(count: int, adjective: str) -> str:
+    return f"eine {adjective} Prüfung" if count == 1 else f"{count} {adjective} Prüfungen in Folge"
+
+
+def _detection_text(failure: int, recovery: int) -> str:
+    return (f"Verbindungsausfall (Leitung, Router, Lokal): ab {_rounds(failure, 'fehlerhafte')}. Störung einzelner "
+            f"Dienste (DNS, HTTPS): ab {_rounds(max(failure, STABLE_ROUNDS), 'fehlerhafte')}. Beendet durch "
+            f"{_rounds(recovery, 'fehlerfreie')}. Start ist die erste fehlerhafte, Ende die erste fehlerfreie "
+            "Prüfung. Kurze Aussetzer aus Messungen mit älteren Einstellungen sind aus den gespeicherten "
+            "Prüfrunden nachgetragen.")
+
+
 def _methodology(config: Config, sessions: list[dict[str, Any]], styles: dict[str, ParagraphStyle],
                  interval_s: float | None = None) -> list[Any]:
     reach = config.reachability
@@ -427,9 +447,7 @@ def _methodology(config: Config, sessions: list[dict[str, Any]], styles: dict[st
                     f"{', '.join(reach.external_targets)}, dazu eine DNS-Abfrage (System, eigener DNS-Server im "
                     f"Heimnetz und zum Vergleich {', '.join(reach.dns_reference_servers) or 'kein öffentlicher Server'})"
                     " und ein HTTPS-Abruf"),
-        ("Ausfall-Erkennung", f"{reach.failure_threshold} fehlerhafte Prüfungen in Folge eröffnen, "
-                              f"{reach.recovery_threshold} fehlerfreie beenden einen Ausfall. Start ist die erste "
-                              "fehlerhafte, Ende die erste fehlerfreie Prüfung."),
+        ("Ausfall-Erkennung", _detection_text(reach.failure_threshold, reach.recovery_threshold)),
     ]
     rows = [(key, Paragraph(escape(value), styles["cell"])) for key, value in rows]
     method_text = (
@@ -602,6 +620,7 @@ def _build(config: Config, store: Store, start: datetime, end: datetime, directo
     threshold = monitor_gap_threshold(config.reachability.interval_s)
     samples = load_samples(store, start, effective_end)
     outages = load_outages(store, start, effective_end)
+    outages = sorted(outages + dropouts_from_samples(samples, outages, threshold), key=lambda item: item.start)
     stamps = [parse_iso(stamp) for stamp in store.cycle_times(start, effective_end)]
     coverage: Coverage = compute_coverage(stamps, start, effective_end, threshold, zone)
     summary = compute_summary(samples, outages, coverage, start, effective_end, zone)

@@ -7,7 +7,8 @@ timezone = "Europe/Berlin"     # Lokale Zeit in Berichten und Webinterface
 
 [reachability]
 interval_s = 3                 # 1 bis 60, empfohlen 2 bis 5
-failure_threshold = 3          # So viele fehlerhafte Prüfungen in Folge eröffnen einen Ausfall
+failure_threshold = 1          # Fehlerhafte Prüfungen in Folge bis zum Ausfall. 1 = jeder Aussetzer zählt
+                               # (DNS- und HTTPS-Störungen brauchen immer mindestens 3)
 recovery_threshold = 2         # So viele fehlerfreie Prüfungen in Folge beenden ihn
 lan_targets = "auto"           # "auto" oder Liste, z. B. ["192.168.0.1"]
 isp_hop = "auto"               # "auto" (per Traceroute) oder feste IP

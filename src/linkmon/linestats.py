@@ -10,6 +10,9 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import numpy as np
+import pandas as pd
+
 from linkmon.levels import Level
 from linkmon.stats import Outage, availability, compute_coverage, merge_intervals
 
@@ -34,6 +37,56 @@ ROLLING_PERIODS: list[tuple[str, timedelta]] = [
     ("Letzte 7 Tage", timedelta(days=7)),
     ("Letzte 30 Tage", timedelta(days=30)),
 ]
+
+
+DROPOUT_DETAIL = "Kurzer Aussetzer, nachträglich aus den Prüfrunden ermittelt"
+
+
+def dropouts_from_samples(samples: pd.DataFrame, outages: list[Outage], gap_threshold_s: float) -> list[Outage]:
+    """Findet kurze Leitungsaussetzer in den gespeicherten Prüfrunden, die nie als Ausfall geloggt wurden.
+
+    Ältere Versionen eröffneten einen Ausfall erst nach drei fehlerhaften Runden. Die Runden selbst sind aber
+    vollständig gespeichert: Eine Runde zählt zur Leitung, wenn kein Router im Heimnetz ausfiel, aber alle
+    externen Ziele schwiegen. Wie beim Messdienst beginnt ein Aussetzer mit der ersten solchen Runde und endet
+    mit der nächsten Runde danach. Runden, die schon in einem geloggten Ausfall liegen, bleiben außen vor.
+    """
+    if samples.empty:
+        return []
+    external = [column for column in samples.columns if column.startswith("ext:") and column.endswith("|ok")]
+    home = [column for column in samples.columns if column.startswith("lan:") and column.endswith("|ok")]
+    if not external:
+        return []
+    line = (samples[external] == 0).all(axis=1)
+    if home:
+        line &= (samples[home] != 0).all(axis=1)  # -1 heißt: nicht geprüft
+    flags = line.to_numpy()
+    if not flags.any():
+        return []
+    stamps = samples["ts"]
+    count = len(stamps)
+
+    def at(position: int) -> datetime:  # Nur die gebrauchten Zeiten umwandeln: Ein Monat hat ~900.000 Runden.
+        return stamps.iloc[position].to_pydatetime()
+
+    # Ohne Zeitzone rechnet numpy direkt auf den Zahlen, mit ihr auf einzelnen Objekten (hundertfach langsamer).
+    plain = samples["ts"].dt.tz_convert("UTC").dt.tz_localize(None).to_numpy()
+    steps = np.diff(plain) / np.timedelta64(1, "s")
+    typical = float(np.median(steps)) if len(steps) else 0.0
+    known = sorted((outage.start, outage.end) for outage in outages)
+
+    edges = np.diff(np.concatenate([[False], flags, [False]]).astype(np.int8))
+    found: list[Outage] = []
+    for first, after in zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)):
+        last = after - 1
+        start = at(first)
+        if after < count and steps[last] <= gap_threshold_s:
+            end, confirmed = at(after), True
+        else:  # Danach lief das Tool nicht weiter: Das Ende ist unbekannt.
+            end, confirmed = at(last) + timedelta(seconds=typical), False
+        if any(begin < end and start <= finish for begin, finish in known):
+            continue
+        found.append(Outage(Level.LINE, DROPOUT_DETAIL, start, end, confirmed))
+    return found
 
 
 def line_outages(outages: list[Outage]) -> list[Outage]:

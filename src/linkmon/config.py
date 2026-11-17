@@ -28,7 +28,7 @@ class General:
 @dataclass(frozen=True)
 class Reachability:
     interval_s: float = 3.0
-    failure_threshold: int = 3
+    failure_threshold: int = 1
     recovery_threshold: int = 2
     lan_targets: str | list[str] = "auto"
     isp_hop: str = "auto"

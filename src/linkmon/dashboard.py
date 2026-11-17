@@ -33,6 +33,7 @@ from linkmon.quality import (
     load_samples,
     ping_tracks,
 )
+from linkmon.linestats import dropouts_from_samples
 from linkmon.stats import Coverage, Outage, compute_coverage, load_outages, total_seconds
 from linkmon.store import Store
 from linkmon.timeutil import format_duration, format_local, iso_utc, now_utc, parse_iso
@@ -634,6 +635,7 @@ def load_view(config: Config, store: Store, start: datetime, end: datetime, now:
     threshold = monitor_gap_threshold(config.reachability.interval_s)
     coverage = compute_coverage(stamps, first, finish, threshold, config.zone)
     outages = load_outages(store, first, finish, now=now)
+    outages = sorted(outages + dropouts_from_samples(samples, outages, threshold), key=lambda item: item.start)
     gaps = coverage.gaps if coverage.cycles else []
     return {"samples": samples, "coverage": coverage, "outages": outages, "gaps": gaps, "start": first,
             "end": finish, "stats": all_track_stats(samples)}
