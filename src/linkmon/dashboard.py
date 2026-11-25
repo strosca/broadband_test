@@ -10,9 +10,11 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from dash import Dash, Input, Output, State, dash_table, dcc, html, no_update
+from dash.exceptions import PreventUpdate
 from plotly.subplots import make_subplots
 
 from linkmon.config import Config
@@ -31,7 +33,9 @@ from linkmon.quality import (
     hour_matrix,
     latest_internet_ms,
     load_samples,
+    BUCKET_STEPS_MIN,
     ping_tracks,
+    track_stats,
 )
 from linkmon.linestats import dropouts_from_samples
 from linkmon.stats import Coverage, Outage, compute_coverage, load_outages, total_seconds
@@ -50,9 +54,16 @@ COLOR_GAP = "#55544f"
 # Kategoriale Reihenfolge: Die Farbe folgt der Strecke (Internet, Provider-Hop, Heimnetz ...), nie dem Rang.
 SERIES_COLORS = ("#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9")
 LEVEL_COLORS_DARK = {"line": "#e66767", "router": "#c98500", "local": "#9085e9", "dns_home": "#3fa7d6",
-                     "dns": "#d55181", "https": "#008300"}
-# Blaue Rampe für Mengen: dunkel nahe der Fläche heißt wenig, hell heißt viel.
-SEQUENTIAL_DARK = [[0.0, "#0d366b"], [0.35, "#1c5cab"], [0.7, "#3987e5"], [1.0, "#b7d3f6"]]
+                     "dns": "#d55181", "https": "#4fc3d9"}  # HTTPS nicht grün: Grün heißt hier „alles ok“.
+# Ampel für Ping und Verlust: Grün heißt normal, darüber beginnt die Skala sprunghaft bei Gelb.
+# So ist 0 % Verlust sofort von 0,1 % zu unterscheiden, und 20 ms nicht mit 80 ms zu verwechseln.
+COLOR_OK = "#2f9e44"
+SEVERITY_FLOOR = 0.12
+SEVERITY_SCALE = [[0.0, COLOR_OK], [SEVERITY_FLOOR, COLOR_OK], [SEVERITY_FLOOR, "#e3c23b"],
+                  [0.5, "#f08c2b"], [1.0, "#e5484d"]]
+# Verlust: ab 0,05 % beginnt Gelb, ab 5 % ist es voll rot.
+LOSS_LOW_PCT = 0.05
+LOSS_HIGH_PCT = 5.0
 TABLE_OUTAGE_FILL = "#2c1c1b"
 TABLE_GAP_FILL = "#232322"
 
@@ -68,6 +79,60 @@ KIND_GAP = "Messlücke"
 # jede Sekunde, die ganze Seite wird aber nur neu berechnet, wenn sich der Zustand ändert.
 LIVE_POLL_MS = 1000
 _CACHE = SampleCache()
+# Unterhalb dieser Breite gilt die Seite als Handyansicht: kompakte Grafiken, kein Ziehen zum Zoomen.
+MOBILE_MAX_PX = 720
+SHORT_LEVEL_LABELS = {"line": "Leitung", "router": "Router", "local": "Lokal", "dns_home": "Pi-hole",
+                      "dns": "DNS", "https": "HTTPS"}
+OUTAGE_LIST_LIMIT = 8
+
+
+def loss_severity(values: Any) -> Any:
+    """0 bleibt 0 (grün). Jeder Verlust darüber landet mindestens bei SEVERITY_FLOOR, logarithmisch bis 1."""
+    pct = np.asarray(values, dtype=float)
+    span = np.log10(LOSS_HIGH_PCT / LOSS_LOW_PCT)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        scaled = np.clip(np.log10(pct / LOSS_LOW_PCT) / span, 0, 1)
+    result = np.where(pct > 0, SEVERITY_FLOOR + (1 - SEVERITY_FLOOR) * scaled, 0.0)
+    return np.where(np.isnan(pct), np.nan, result)
+
+
+def ping_limits(median_ms: float | None) -> tuple[float, float]:
+    """Grenze für „normal“ und für „voll rot“, gemessen am üblichen Ping der Strecke.
+
+    Normal ist der Median plus etwas Luft (mindestens 5 ms). Bei 17 ms Median also bis etwa 25 ms grün,
+    ab etwa 100 ms rot. Für das Heimnetz mit 1 ms ist schon 10 ms auffällig.
+    """
+    median = median_ms if median_ms and median_ms > 0 else 20.0
+    good = median + max(5.0, 0.5 * median)
+    return good, max(4 * good, good + 60)
+
+
+def ping_severity(values: Any, good: float, bad: float) -> Any:
+    ms = np.asarray(values, dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        scaled = np.clip(np.log(ms / good) / np.log(bad / good), 0, 1)
+    result = np.where(ms > good, SEVERITY_FLOOR + (1 - SEVERITY_FLOOR) * scaled, 0.0)
+    return np.where(np.isnan(ms), np.nan, result)
+
+
+def severity_tone(severity: float | None) -> str:
+    """Grob in drei Stufen für Kacheln und Tabelle."""
+    if severity is None or np.isnan(severity):
+        return "tone-none"
+    if severity <= 0:
+        return "tone-ok"
+    return "tone-warn" if severity < 0.5 else "tone-bad"
+
+
+def short_duration(seconds: float) -> str:
+    total = int(round(seconds))
+    if total < 60:
+        return f"{total} s"
+    if total < 3600:
+        minutes, secs = divmod(total, 60)
+        return f"{minutes} min {secs} s" if secs else f"{minutes} min"
+    hours, rest = divmod(total, 3600)
+    return f"{hours} h {rest // 60} min"
 
 
 def _number(value: Any, digits: int) -> str:
@@ -116,63 +181,155 @@ def empty_figure(text: str, height: int = 320) -> go.Figure:
     return figure
 
 
-def _time_axes(figure: go.Figure) -> None:
+def _time_axes(figure: go.Figure, mobile: bool = False) -> None:
     # Das Format folgt dem Zoom, sonst stünde bei kurzen Zeiträumen mehrfach dieselbe Minute da.
-    figure.update_xaxes(gridcolor=COLOR_GRID, linecolor=COLOR_AXIS, showgrid=False, ticks="outside", ticklen=8,
-                        tickcolor="rgba(0,0,0,0)", tickformatstops=[
+    # Am Handy zweizeilig und mit wenigen Ticks: Schräge Beschriftungen fressen dort die halbe Höhe.
+    joiner = "<br>" if mobile else " "
+    figure.update_xaxes(gridcolor=COLOR_GRID, linecolor=COLOR_AXIS, showgrid=False, ticks="outside", ticklen=6,
+                        tickcolor="rgba(0,0,0,0)", tickangle=0, nticks=5 if mobile else None,
+                        tickfont={"size": 10 if mobile else 12}, tickformatstops=[
                             {"dtickrange": [None, 59999], "value": "%H:%M:%S"},
-                            {"dtickrange": [60000, 43199999], "value": "%d.%m. %H:%M"},
+                            {"dtickrange": [60000, 43199999], "value": f"%H:%M{joiner}%d.%m." if mobile
+                             else "%d.%m. %H:%M"},
                             {"dtickrange": [43200000, None], "value": "%d.%m."},
                         ])
     figure.update_yaxes(gridcolor=COLOR_GRID, linecolor=COLOR_AXIS, zeroline=False,
                         title_font={"color": COLOR_INK_3, "size": 11})
 
 
+def _interaction(mobile: bool) -> dict[str, Any]:
+    """Am Handy nichts ziehen oder zoomen: Wischen soll die Seite scrollen, Tippen zeigt den Wert."""
+    if mobile:
+        return {"dragmode": False, "hovermode": "closest"}
+    return {"dragmode": "zoom", "hovermode": "closest"}
+
+
 def _timeline_rows(outages: list[Outage], gaps: list[tuple[datetime, datetime]]) -> list[str]:
-    present = {outage.level for outage in outages}
-    rows = [LEVEL_LABELS[level] for level in LEVEL_ORDER if level in present]
+    """Die Leitung steht immer oben, auch ohne Ausfall: Eine durchgehend grüne Zeile ist die gute Nachricht."""
+    present = {outage.level for outage in outages} | {"line"}
+    rows = [level for level in LEVEL_ORDER if level in present]
     if gaps:
         rows.append(KIND_GAP)
     return rows
 
 
-def _timeline_trace(label: str, intervals: list[tuple[datetime, datetime, str]], color: str, zone: ZoneInfo,
-                    minimum: timedelta) -> go.Scatter:
-    """Zeichnet Intervalle als dicke Linienstücke in einer Zeile. Sehr kurze bleiben mit Mindestlänge sichtbar."""
-    xs: list[datetime | None] = []
-    texts: list[str | None] = []
-    for begin, finish, text in intervals:
-        finish = max(finish, begin + minimum)
-        xs += [_naive(begin, zone), _naive(finish, zone), None]
-        texts += [text, text, None]
-    return go.Scatter(x=xs, y=[label if x is not None else None for x in xs], mode="lines", name=label,
-                      line={"color": color, "width": 14}, hovertext=texts, hoverinfo="text", showlegend=False,
-                      connectgaps=False)
+def _segments(intervals: list[tuple[datetime, datetime]], row: str, zone: ZoneInfo,
+              minimum: timedelta) -> tuple[list[Any], list[Any]]:
+    xs: list[Any] = []
+    for begin, finish in intervals:
+        xs += [_naive(begin, zone), _naive(max(finish, begin + minimum), zone), None]
+    return xs, [row if x is not None else None for x in xs]
 
 
-def _add_timeline(figure: go.Figure, outages: list[Outage], gaps: list[tuple[datetime, datetime]],
-                  zone: ZoneInfo, span_s: float) -> None:
-    """Oberste Zeile: jeder Ausfall in der Zeile seiner Ebene, dazu die Messlücken."""
-    minimum = timedelta(seconds=max(span_s * 0.002, 1))
-    for level in LEVEL_ORDER:
-        items = [outage for outage in outages if outage.level == level]
-        if not items:
+def _covered(start: datetime, end: datetime, gaps: list[tuple[datetime, datetime]]) -> list[tuple[datetime, datetime]]:
+    """Zeit, in der gemessen wurde: der Zeitraum ohne die Messlücken."""
+    pieces: list[tuple[datetime, datetime]] = []
+    cursor = start
+    for begin, finish in sorted(gaps):
+        if begin > cursor:
+            pieces.append((cursor, min(begin, end)))
+        cursor = max(cursor, finish)
+    if cursor < end:
+        pieces.append((cursor, end))
+    return pieces
+
+
+def _outage_text(outage: Outage, zone: ZoneInfo) -> str:
+    suffix = " (läuft noch)" if outage.ongoing else ("" if outage.confirmed else " (Ende unbestätigt)")
+    return (f"<b>{LEVEL_LABELS.get(outage.level, outage.level)}</b><br>{format_local(outage.start, zone)}<br>"
+            f"Dauer {short_duration(outage.duration_s)}{suffix}<br>{outage.detail}")
+
+
+def build_outage_figure(outages: list[Outage], gaps: list[tuple[datetime, datetime]], start: datetime,
+                        end: datetime, zone: ZoneInfo, *, mobile: bool = False,
+                        revision: str = "linkmon") -> go.Figure:
+    """Wann war was weg: je Ebene eine Zeile, grün solange gemessen wurde und alles lief.
+
+    Ausfälle von wenigen Sekunden wären bei 24 Stunden schmaler als ein Pixel. Deshalb bekommt jeder
+    Ausfall zusätzlich einen senkrechten Strich in voller Zeilenhöhe, der immer sichtbar bleibt.
+    """
+    rows = _timeline_rows(outages, gaps)
+    labels = {row: (SHORT_LEVEL_LABELS.get(row, row) if mobile else LEVEL_LABELS.get(row, row)) for row in rows}
+    figure = go.Figure()
+    span = end - start
+    minimum = max(span * 0.002, timedelta(seconds=1))
+    covered = _covered(start, end, gaps)
+    for row in rows:
+        if row == KIND_GAP:
             continue
-        label = LEVEL_LABELS[level]
-        intervals = []
-        for outage in items:
-            suffix = " (läuft noch)" if outage.ongoing else ("" if outage.confirmed else " (Ende unbestätigt)")
-            intervals.append((outage.start, outage.end,
-                              f"<b>{label}</b><br>{format_local(outage.start, zone)} bis "
-                              f"{format_local(outage.end, zone)}{suffix}<br>Dauer "
-                              f"{format_duration(outage.duration_s)}<br>{outage.detail}"))
-        figure.add_trace(_timeline_trace(label, intervals, LEVEL_COLORS_DARK[level], zone, minimum), row=1, col=1)
-    if gaps:
-        intervals = [(begin, finish, f"<b>Messlücke</b> (Tool lief nicht)<br>{format_local(begin, zone)} bis "
-                                     f"{format_local(finish, zone)}<br>Dauer "
-                                     f"{format_duration((finish - begin).total_seconds())}")
-                     for begin, finish in gaps]
-        figure.add_trace(_timeline_trace(KIND_GAP, intervals, COLOR_GAP, zone, minimum), row=1, col=1)
+        xs, ys = _segments(covered, labels[row], zone, timedelta(0))
+        figure.add_trace(go.Scatter(x=xs, y=ys, mode="lines", line={"color": _transparent(COLOR_OK, 0.55), "width": 10},
+                                    hoverinfo="skip", showlegend=False, name=f"{labels[row]} ok"))
+    for row in rows:
+        if row == KIND_GAP:
+            intervals = gaps
+            color = COLOR_GAP
+            texts = [f"<b>Messlücke</b> (Tool lief nicht)<br>{format_local(b, zone)}<br>Dauer "
+                     f"{short_duration((f - b).total_seconds())}" for b, f in gaps]
+        else:
+            items = [outage for outage in outages if outage.level == row]
+            intervals = [(outage.start, outage.end) for outage in items]
+            color = LEVEL_COLORS_DARK.get(row, COLOR_INK_2)
+            texts = [_outage_text(outage, zone) for outage in items]
+        if not intervals:
+            continue
+        name = KIND_GAP if row == KIND_GAP else LEVEL_LABELS.get(row, row)
+        xs, ys = _segments(intervals, labels[row], zone, minimum)
+        figure.add_trace(go.Scatter(x=xs, y=ys, mode="lines", line={"color": color, "width": 16}, hoverinfo="skip",
+                                    showlegend=False, name=name + " Dauer", connectgaps=False))
+        middles = [_naive(begin + (finish - begin) / 2, zone) for begin, finish in intervals]
+        figure.add_trace(go.Scatter(
+            x=middles, y=[labels[row]] * len(middles), mode="markers", name=name, showlegend=False,
+            marker={"symbol": "line-ns", "size": 22, "line": {"width": 3, "color": color}},
+            hovertext=texts, hoverinfo="text",
+        ))
+    height = (44 if mobile else 40) * len(rows) + (58 if mobile else 50)
+    figure.update_layout(height=height, margin={"l": 8, "r": 12 if mobile else 20, "t": 6, "b": 8},
+                         uirevision=revision, showlegend=False, **_interaction(mobile), **_base_layout())
+    _time_axes(figure, mobile)
+    figure.update_xaxes(range=[_naive(start, zone), _naive(end, zone)], fixedrange=mobile, showline=True)
+    figure.update_yaxes(type="category", categoryorder="array", categoryarray=[labels[row] for row in rows],
+                        autorange="reversed", showgrid=False, fixedrange=True, ticks="",
+                        ticklabelstandoff=8, tickfont={"size": 12, "color": COLOR_INK_2})
+    if not outages:
+        figure.add_annotation(text="Keine Ausfälle im Zeitraum", xref="paper", yref="paper", x=0.5, y=1,
+                              yanchor="top", showarrow=False, font={"color": COLOR_INK_3, "size": 11})
+    return figure
+
+
+def outage_summary(outages: list[Outage]) -> str:
+    if not outages:
+        return "Keine Ausfälle"
+    counts = [(level, sum(1 for outage in outages if outage.level == level)) for level in LEVEL_ORDER]
+    parts = [f"{count}× {SHORT_LEVEL_LABELS.get(level, level)}" for level, count in counts if count]
+    line = total_seconds([(o.start, o.end) for o in outages if o.level == "line"])
+    text = ", ".join(parts)
+    return text + (f" · Leitung zusammen {short_duration(line)}" if line else "")
+
+
+def outage_list(outages: list[Outage], zone: ZoneInfo, limit: int = OUTAGE_LIST_LIMIT) -> html.Div:
+    """Die letzten Ausfälle als kurze Liste: am Handy lesbarer als jede Tabelle."""
+    if not outages:
+        return html.Div("Im gewählten Zeitraum lief alles.", className="outage-empty")
+    items = []
+    for outage in sorted(outages, key=lambda item: item.start, reverse=True)[:limit]:
+        color = LEVEL_COLORS_DARK.get(outage.level, COLOR_INK_2)
+        state = "läuft noch" if outage.ongoing else short_duration(outage.duration_s)
+        items.append(html.Li([
+            html.Span(className="outage-mark", style={"background": color}),
+            html.Div([
+                html.Div([html.Span(LEVEL_LABELS.get(outage.level, outage.level), className="outage-level"),
+                          html.Span(state, className="outage-duration" + (" is-live" if outage.ongoing else ""))],
+                         className="outage-top"),
+                html.Div(f"{outage.start.astimezone(zone):%d.%m. %H:%M:%S}", className="outage-time"),
+                html.Div(outage.detail, className="outage-detail"),
+            ], className="outage-body"),
+        ], className="outage-item"))
+    rest = len(outages) - limit
+    children: list[Any] = [html.Ul(items, className="outage-list")]
+    if rest > 0:
+        children.append(html.Div(f"und {rest} weitere, alle in der Tabelle unter Details", className="outage-more"))
+    return html.Div(children)
 
 
 def _band(times: pd.DatetimeIndex, low: pd.Series, high: pd.Series) -> tuple[list[Any], list[Any]]:
@@ -193,108 +350,161 @@ def _band(times: pd.DatetimeIndex, low: pd.Series, high: pd.Series) -> tuple[lis
     return xs, ys
 
 
-def build_figure(samples: pd.DataFrame, outages: list[Outage], gaps: list[tuple[datetime, datetime]],
-                 start: datetime, end: datetime, zone: ZoneInfo, *, log_latency: bool = False,
-                 revision: str = "linkmon") -> go.Figure:
-    timeline = _timeline_rows(outages, gaps)
-    top_share = 0.06 + 0.035 * max(len(timeline), 1)
-    figure = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.07,
-                           row_heights=[top_share, (1 - top_share) * 0.6, (1 - top_share) * 0.4],
-                           subplot_titles=("Ausfälle", "Ping (Median je Intervall)", "Paketverlust"))
-    for heading in figure.layout.annotations:
-        heading.update(x=0, xanchor="left", font={"size": 12, "color": COLOR_INK_3, "family": FONT})
+def track_options(samples: pd.DataFrame) -> list[dict[str, Any]]:
+    """Strecken zum Ein- und Ausblenden. Das Farbfeld ersetzt die Legende, die am Handy alles verdeckt."""
+    return [{"label": html.Span([html.Span(className="swatch", style={"background": series_color(position)}),
+                                 track.label]), "value": track.key}
+            for position, track in enumerate(ping_tracks(samples))]
 
-    span_s = (end - start).total_seconds()
-    _add_timeline(figure, outages, gaps, zone, span_s)
+
+def _strip_size(start: datetime, end: datetime, columns: int) -> pd.Timedelta:
+    span_min = max((end - start).total_seconds() / 60, 1)
+    step = next((step for step in BUCKET_STEPS_MIN if span_min / step <= columns), BUCKET_STEPS_MIN[-1])
+    return pd.Timedelta(minutes=step)
+
+
+def build_figure(samples: pd.DataFrame, outages: list[Outage], gaps: list[tuple[datetime, datetime]],
+                 start: datetime, end: datetime, zone: ZoneInfo, *, selected: list[str] | None = None,
+                 log_latency: bool = False, mobile: bool = False, revision: str = "linkmon") -> go.Figure:
+    """Ping und Verlust der gewählten Strecken.
+
+    Ping linear: Seltene Spitzen würden die Achse strecken, deshalb endet sie knapp über dem Üblichen,
+    und was darüber liegt, steht als Dreieck am oberen Rand. Punkte über dem Normalwert tragen die Ampelfarbe.
+    Verlust als Farbstreifen je Strecke: grün bei 0, sonst Ampel. Auch 0,2 % fallen so sofort auf.
+    """
+    every = ping_tracks(samples)
+    chosen = [(position, track) for position, track in enumerate(every)
+              if selected is None or track.key in selected]
+    if selected is None:
+        chosen = [(position, track) for position, track in chosen if track.key == INTERNET] or chosen[:1]
+    strips = max(len(chosen), 1)
+    ping_px = 230 if mobile else 330
+    strip_px = 24 * strips + 20
+    figure = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.0,
+                           row_heights=[ping_px, strip_px + 40])
     size = bucket_size(start, end)
     minutes = size / pd.Timedelta(minutes=1)
     size_text = f"{minutes / 60:g} h" if minutes >= 60 else f"{minutes:g} min"
-    figure.layout.annotations[1].update(text=f"Ping (Median je {size_text})")
-    figure.layout.annotations[2].update(text=f"Paketverlust (Anteil je {size_text})")
 
-    for position, track in enumerate(ping_tracks(samples)):
-        color = series_color(position)
+    # Der Verluststreifen braucht gröbere Spalten als der Ping: Bei 1440 Minuten auf 350 Pixeln wäre jede
+    # Spalte schmaler als ein Pixel, und einzelne Verluste verschwänden im Grün.
+    strip_size = _strip_size(start, end, 120 if mobile else 360)
+    tables = []
+    for position, track in chosen:
         table = bucket_table(samples, track, size)
+        values = table["median"].dropna()
+        good, bad = ping_limits(float(values.median()) if len(values) else None)
+        tables.append((position, track, table, good, bad))
+
+    typical = [float(table["median"].quantile(0.99)) for _, _, table, _, _ in tables
+               if table["median"].notna().any()]
+    goods = [good for _, _, _, good, _ in tables]
+    cap = max(max(goods, default=30.0) * 2.5, max(typical, default=0.0) * 1.15)
+
+    for position, track, table, good, bad in tables:
+        color = series_color(position)
         times = _naive_index(table.index, zone)
         extra = table[["p95", "max", "loss_pct", "sent"]].to_numpy()
-        if track.key == INTERNET:
-            # Band vom Median bis P95: zeigt die Spitzen, ohne eine zweite Linie in die Legende zu bringen.
+        hover = ("%{y:.0f} ms, P95 %{customdata[0]:.0f}, max %{customdata[1]:.0f} ms<extra>" + track.label
+                 + "</extra>")
+        if track.key == INTERNET and len(chosen) == 1:
             band_x, band_y = _band(times, table["median"], table["p95"])
             figure.add_trace(go.Scatter(x=band_x, y=band_y, mode="lines", fill="toself", line={"width": 0},
-                                        fillcolor=_transparent(color, 0.18), hoverinfo="skip", showlegend=False,
-                                        legendgroup=track.key), row=2, col=1)
-        figure.add_trace(go.Scatter(
-            x=times, y=table["median"], name=track.label, mode="lines", legendgroup=track.key,
-            line={"color": color, "width": 2}, connectgaps=False, customdata=extra,
-            hovertemplate="%{y:.0f} ms, P95 %{customdata[0]:.0f}, max %{customdata[1]:.0f} ms<extra>"
-                          + track.label + "</extra>",
+                                        fillcolor=_transparent(color, 0.15), hoverinfo="skip", showlegend=False),
+                             row=1, col=1)
+        figure.add_trace(go.Scatter(x=times, y=table["median"], name=track.label, mode="lines",
+                                    line={"color": color, "width": 1.5}, connectgaps=False, customdata=extra,
+                                    hovertemplate=hover), row=1, col=1)
+        severity = ping_severity(table["median"], good, bad)
+        high = severity > 0
+        if high.any():
+            shown = table["median"][high]
+            if not log_latency:
+                shown = shown.clip(upper=cap)
+            figure.add_trace(go.Scatter(
+                x=times[high], y=shown, mode="markers", name=track.label + " erhöht", showlegend=False,
+                marker={"color": severity[high], "colorscale": SEVERITY_SCALE, "cmin": 0, "cmax": 1, "size": 7,
+                        "symbol": np.where(table["median"][high] > cap, "triangle-up", "circle")
+                        if not log_latency else "circle",
+                        "line": {"width": 0}},
+                # Bei gedeckelten Spitzen zeigt y nur den Rand: Der echte Wert steht in text.
+                customdata=extra[high], text=[f"{value:.0f}" for value in table["median"][high]],
+                hovertemplate=hover.replace("%{y:.0f}", "%{text}"),
+            ), row=1, col=1)
+        strip = bucket_table(samples, track, strip_size)
+        loss = strip["loss_pct"].to_numpy(dtype=float)
+        figure.add_trace(go.Heatmap(
+            x=_naive_index(strip.index + strip_size / 2, zone), y=[track.label], z=[loss_severity(loss)], customdata=[np.nan_to_num(loss, nan=-1)],
+            colorscale=SEVERITY_SCALE, zmin=0, zmax=1, showscale=False, name=track.label + " Verlust",
+            hovertemplate="%{x|%d.%m. %H:%M}: %{customdata:.2f} % Verlust<extra>" + track.label + "</extra>", ygap=3,
         ), row=2, col=1)
-        figure.add_trace(go.Scatter(
-            x=times, y=table["loss_pct"], name=track.label, mode="lines", line={"color": color, "width": 2, "shape": "hv"},
-            legendgroup=track.key, showlegend=False, connectgaps=False, customdata=extra,
-            hovertemplate="%{y:.1f} % von %{customdata[3]:.0f} Pings<extra>" + track.label + "</extra>",
-        ), row=3, col=1)
 
-    shapes: list[dict[str, Any]] = []
+    if len(chosen) == 1 and tables:
+        figure.add_hrect(y0=0, y1=tables[0][3], fillcolor=COLOR_OK, opacity=0.08, line_width=0, layer="below",
+                         row=1, col=1)
     for outage in outages:
-        color = LEVEL_COLORS_DARK.get(outage.level, COLOR_INK_2)
-        for axis in ("y2", "y3"):
-            shapes.append({"type": "rect", "xref": "x", "yref": f"{axis} domain", "y0": 0, "y1": 1,
-                           "x0": _naive(outage.start, zone), "x1": _naive(outage.end, zone),
-                           "fillcolor": color, "opacity": 0.18, "line": {"width": 0}, "layer": "below"})
+        figure.add_vrect(x0=_naive(outage.start, zone), x1=_naive(outage.end, zone), row=1, col=1,
+                         fillcolor=LEVEL_COLORS_DARK.get(outage.level, COLOR_INK_2), opacity=0.25,
+                         line_width=1, line_color=LEVEL_COLORS_DARK.get(outage.level, COLOR_INK_2), layer="below")
     for begin, finish in gaps:
-        for axis in ("y2", "y3"):
-            shapes.append({"type": "rect", "xref": "x", "yref": f"{axis} domain", "y0": 0, "y1": 1,
-                           "x0": _naive(begin, zone), "x1": _naive(finish, zone),
-                           "fillcolor": COLOR_GAP, "opacity": 0.45, "line": {"width": 0}, "layer": "below"})
+        figure.add_vrect(x0=_naive(begin, zone), x1=_naive(finish, zone), row=1, col=1, fillcolor=COLOR_GAP,
+                         opacity=0.4, line_width=0, layer="below")
 
-    height = 640 + 22 * len(timeline)
-    figure.update_layout(
-        height=height, margin={"l": 54, "r": 20, "t": 44, "b": 30}, hovermode="x unified", uirevision=revision,
-        shapes=shapes,
-        legend={"orientation": "h", "yanchor": "bottom", "y": 1.03, "x": 0, "bgcolor": "rgba(0,0,0,0)",
-                "font": {"color": COLOR_INK_2, "size": 12}},
-        **_base_layout(),
-    )
-    _time_axes(figure)
-    figure.update_xaxes(range=[_naive(start, zone), _naive(end, zone)])
-    figure.update_yaxes(row=1, col=1, type="category", categoryorder="array", categoryarray=timeline or [" "],
-                        autorange="reversed", showgrid=False, fixedrange=True, tickfont={"size": 11})
+    figure.update_layout(height=ping_px + strip_px + 70, margin={"l": 44 if mobile else 54, "r": 12, "t": 30, "b": 10},
+                         uirevision=revision, showlegend=False, **_interaction(mobile), **_base_layout())
+    _time_axes(figure, mobile)
+    figure.update_xaxes(range=[_naive(start, zone), _naive(end, zone)], fixedrange=mobile)
+    figure.update_xaxes(showticklabels=False, row=1, col=1)
     if log_latency:
         ticks = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000]
         figure.update_yaxes(title_text="ms", type="log", tickvals=ticks, ticktext=[str(t) for t in ticks],
-                            row=2, col=1)
+                            fixedrange=mobile, row=1, col=1)
     else:
-        figure.update_yaxes(title_text="ms", rangemode="tozero", row=2, col=1)
-    figure.update_yaxes(title_text="%", rangemode="tozero", row=3, col=1)
-    if not timeline:
-        figure.add_annotation(text="Keine Ausfälle und Messlücken im Zeitraum", xref="x domain", yref="y domain",
-                              x=0.5, y=0.5, showarrow=False, font={"color": COLOR_INK_3, "size": 12}, row=1, col=1)
+        figure.update_yaxes(title_text="ms", range=[0, cap], fixedrange=mobile, row=1, col=1)
+    figure.update_yaxes(row=2, col=1, type="category", showgrid=False, fixedrange=True, autorange="reversed",
+                        showticklabels=False)
+    figure.add_annotation(text=f"Ping (Median je {size_text})", xref="paper", yref="paper", x=0, y=1, yshift=24,
+                          xanchor="left", showarrow=False, font={"size": 12, "color": COLOR_INK_3})
+    figure.add_annotation(text="Paketverlust (grün: 0 %)", xref="paper", yref="y2 domain", x=0, y=1, yshift=4,
+                          xanchor="left", yanchor="bottom", showarrow=False, font={"size": 12, "color": COLOR_INK_3})
     if samples.empty:
         figure.add_annotation(text="Im gewählten Zeitraum gibt es keine Prüfungen", xref="paper", yref="paper",
-                              x=0.5, y=0.45, showarrow=False, font={"color": COLOR_INK_3, "size": 14})
+                              x=0.5, y=0.55, showarrow=False, font={"color": COLOR_INK_3, "size": 14})
     return figure
 
 
-def build_heatmap(samples: pd.DataFrame, start: datetime, end: datetime, zone: ZoneInfo, value: str) -> go.Figure:
+def build_heatmap(samples: pd.DataFrame, start: datetime, end: datetime, zone: ZoneInfo, value: str,
+                  *, mobile: bool = False) -> go.Figure:
     track = find_track(samples, INTERNET)
+    height = 420 if mobile else 360
     if track is None or samples.empty:
-        return empty_figure("Keine Prüfungen im Zeitraum", height=360)
+        return empty_figure("Keine Prüfungen im Zeitraum", height=height)
     days = days_between(start, end, zone)
     matrix = hour_matrix(samples, track, zone, value, days)
-    unit, digits = ("%", 2) if value == HEAT_LOSS else ("ms", 0)
-    label = "Paketverlust" if value == HEAT_LOSS else "Ping P95"
+    raw = matrix.to_numpy(dtype=float)
+    if value == HEAT_LOSS:
+        severity, label, unit, digits = loss_severity(raw), "Paketverlust", "%", 2
+        ticks = [(0.0, "0"), (float(loss_severity(0.05)), "0,05"), (float(loss_severity(0.5)), "0,5"),
+                 (1.0, "≥5")]
+    else:
+        stats = track_stats(samples, track)
+        good, bad = ping_limits(stats.median_ms)
+        severity, label, unit, digits = ping_severity(raw, good, bad), "Ping P95", "ms", 0
+        ticks = [(0.0, f"≤{good:.0f}"), (float(ping_severity(2 * good, good, bad)), f"{2 * good:.0f}"),
+                 (1.0, f"≥{bad:.0f}")]
     labels = [f"{day[8:10]}.{day[5:7]}." for day in matrix.columns]
     hours = [f"{hour:02d}:00" for hour in matrix.index]
     figure = go.Figure(go.Heatmap(
-        z=matrix.to_numpy(dtype=float), x=labels, y=hours, colorscale=SEQUENTIAL_DARK, zmin=0, xgap=2, ygap=2,
-        hovertemplate=f"%{{x}} %{{y}}<br>{label}: %{{z:.{digits}f}} {unit}<extra></extra>",
-        colorbar={"title": {"text": unit, "font": {"color": COLOR_INK_3, "size": 11}}, "thickness": 10,
-                  "outlinewidth": 0, "tickfont": {"color": COLOR_INK_3, "size": 11}},
+        z=severity, customdata=raw, x=labels, y=hours, colorscale=SEVERITY_SCALE, zmin=0, zmax=1, xgap=2, ygap=2,
+        hovertemplate=f"%{{x}} %{{y}}<br>{label}: %{{customdata:.{digits}f}} {unit}<extra></extra>",
+        colorbar={"title": {"text": unit, "font": {"color": COLOR_INK_3, "size": 11}}, "thickness": 8,
+                  "outlinewidth": 0, "tickfont": {"color": COLOR_INK_3, "size": 10},
+                  "tickvals": [tick for tick, _ in ticks], "ticktext": [text for _, text in ticks]},
     ))
-    figure.update_layout(height=360, margin={"l": 54, "r": 10, "t": 10, "b": 30}, **_base_layout())
-    figure.update_xaxes(showgrid=False, linecolor=COLOR_AXIS, type="category")
-    figure.update_yaxes(showgrid=False, autorange="reversed", type="category", dtick=3)
+    figure.update_layout(height=height, margin={"l": 46, "r": 6, "t": 10, "b": 30}, dragmode=False,
+                         **_base_layout())
+    figure.update_xaxes(showgrid=False, linecolor=COLOR_AXIS, type="category", fixedrange=True)
+    figure.update_yaxes(showgrid=False, autorange="reversed", type="category", dtick=3, fixedrange=True)
     return figure
 
 
@@ -444,12 +654,13 @@ def age_text(seconds: float) -> str:
     return f"vor {seconds / 86400:.0f} d"
 
 
-def _kpi(label: str, value: str, unit: str = "", note: str = "") -> html.Div:
+def _kpi(label: str, value: str, unit: str = "", note: str = "", tone: str = "tone-none") -> html.Div:
+    """Kachel mit Ampelpunkt. Die Farbe ergänzt nur: Wert und Text sagen dasselbe auch ohne sie."""
     return html.Div([
-        html.Div(label, className="kpi-label"),
+        html.Div([html.Span(className="kpi-dot"), label], className="kpi-label"),
         html.Div([value, html.Span(unit, className="kpi-unit")] if unit else value, className="kpi-value"),
         html.Div(note, className="kpi-note"),
-    ], className="card kpi")
+    ], className=f"card kpi {tone}")
 
 
 def _fact(label: str, value: str, live: bool | None = None) -> html.Div:
@@ -527,15 +738,27 @@ def build_overview(store: Store, samples: pd.DataFrame, stats: list[TrackStats],
     availability = 100 * (1 - line_down / coverage.monitored_s) if coverage.monitored_s > 0 else None
     line_count = sum(1 for o in outages if o.level == "line")
     internet = next((item for item in stats if item.track.key == INTERNET), None)
+    if availability is None:
+        availability_tone = "tone-none"
+    else:
+        availability_tone = "tone-ok" if line_down == 0 else ("tone-warn" if availability >= 99.9 else "tone-bad")
+    outage_tone = "tone-ok" if not outages else ("tone-warn" if line_down < 300 else "tone-bad")
+    ping_tone = loss_tone = "tone-none"
+    if internet and internet.median_ms is not None and internet.p95_ms is not None:
+        # Der Median ist per Definition „normal“: Bewertet wird, wie weit die Spitzen (P95) darüber liegen.
+        ping_tone = severity_tone(float(ping_severity(internet.p95_ms, *ping_limits(internet.median_ms))))
+    if internet and internet.loss_pct is not None:
+        loss_tone = severity_tone(float(loss_severity(internet.loss_pct)))
     overview.append(html.Div([
         _kpi("Verfügbarkeit Leitung", _number(availability, 2), "%" if availability is not None else "",
-             f"Überwacht: {format_duration(coverage.monitored_s)}"),
+             f"Überwacht: {format_duration(coverage.monitored_s)}", availability_tone),
         _kpi("Ausfälle", str(len(outages)), "",
-             f"Davon Leitung: {line_count}, zusammen {format_duration(line_down)}"),
+             f"Davon Leitung: {line_count}, zusammen {format_duration(line_down)}", outage_tone),
         _kpi("Ping ins Internet", _number(internet.median_ms if internet else None, 0), "ms",
-             f"Median · P95 {_ms(internet.p95_ms if internet else None)}"),
+             f"Median · P95 {_ms(internet.p95_ms if internet else None)}", ping_tone),
         _kpi("Paketverlust", _number(internet.loss_pct if internet else None, 2), "%",
-             f"{internet.lost} von {internet.sent} Pings unbeantwortet" if internet else "Keine Prüfungen"),
+             f"{internet.lost} von {internet.sent} Pings unbeantwortet" if internet else "Keine Prüfungen",
+             loss_tone),
         _kpi("Jitter", _number(internet.jitter_ms if internet else None, 1), "ms",
              "Schwankung zwischen aufeinanderfolgenden Pings"),
     ], className="kpis"))
@@ -553,9 +776,14 @@ def track_table(stats: list[TrackStats], samples: pd.DataFrame) -> html.Table:
         name: list[Any] = [html.Span(className="swatch", style={"background": color})] if color else \
             [html.Span(className="swatch swatch-empty")]
         name.append(item.track.label)
+        loss_tone = severity_tone(float(loss_severity(item.loss_pct))) if item.loss_pct is not None else "tone-none"
+        p95_tone = "tone-none"
+        if item.track.is_ping and item.median_ms is not None and item.p95_ms is not None:
+            p95_tone = severity_tone(float(ping_severity(item.p95_ms, *ping_limits(item.median_ms))))
         rows.append(html.Tr([
             html.Td(name, className="track-name"), html.Td(f"{item.sent:,}".replace(",", ".")),
-            html.Td(f"{_number(item.loss_pct, 2)} %"), html.Td(_ms(item.median_ms)), html.Td(_ms(item.p95_ms)),
+            html.Td(f"{_number(item.loss_pct, 2)} %", className=f"cell-tone {loss_tone}"),
+            html.Td(_ms(item.median_ms)), html.Td(_ms(item.p95_ms), className=f"cell-tone {p95_tone}"),
             html.Td(_ms(item.max_ms)), html.Td(_ms(item.jitter_ms) if item.track.is_ping else "–"),
         ]))
     if not rows:
@@ -643,8 +871,12 @@ def _card_head(title: str, *extra: Any, note_id: str | None = None) -> html.Div:
 
 
 def load_view(config: Config, store: Store, start: datetime, end: datetime, now: datetime,
-              cache: SampleCache | None = _CACHE) -> dict[str, Any]:
-    """Lädt alles für einen Zeitraum. Vor der ersten Prüfung gab es das Tool noch nicht: keine Messlücke."""
+              cache: SampleCache | None = _CACHE, *, all_stats: bool = True) -> dict[str, Any]:
+    """Lädt alles für einen Zeitraum. Vor der ersten Prüfung gab es das Tool noch nicht: keine Messlücke.
+
+    Ohne all_stats rechnet es nur die Strecke Internet für die Kacheln. Die übrigen Strecken braucht erst
+    die Detailansicht.
+    """
     earliest = store.first_cycle_time()
     first = max(start, parse_iso(earliest)) if earliest else start
     finish = min(end, now)
@@ -658,7 +890,12 @@ def load_view(config: Config, store: Store, start: datetime, end: datetime, now:
     outages = sorted(outages + dropouts_from_samples(samples, outages, threshold), key=lambda item: item.start)
     gaps = coverage.gaps if coverage.cycles else []
     return {"samples": samples, "coverage": coverage, "outages": outages, "gaps": gaps, "start": first,
-            "end": finish, "stats": all_track_stats(samples)}
+            "end": finish, "stats": all_track_stats(samples) if all_stats else _internet_stats(samples)}
+
+
+def _internet_stats(samples: pd.DataFrame) -> list[TrackStats]:
+    track = find_track(samples, INTERNET)
+    return [track_stats(samples, track)] if track else []
 
 
 def create_app(config: Config) -> Dash:
@@ -666,16 +903,21 @@ def create_app(config: Config) -> Dash:
                meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"},
                           {"name": "theme-color", "content": "#0d0d0d"}])
     zone = config.zone
+    graph_config = {"displayModeBar": False, "responsive": True, "scrollZoom": False}
     app.layout = html.Div([
+        dcc.Location(id="url"),
+        dcc.Store(id="mobile"),
+        # Pro Browser gemerkt: Am PC bleiben die Details offen, am Handy zu, wenn man es so eingestellt hat.
+        dcc.Store(id="details-open", storage_type="local", data=False),
         html.Header([
             html.Div([html.Div("↯", className="brand-mark", **{"aria-hidden": "true"}),
                       html.Div("Verfügbarkeit", className="brand-title")], className="brand"),
             html.Div([
+                _segmented("range", DEFAULT_RANGE, [("6 Std.", "6h"), ("24 Std.", "24h"), ("7 Tage", "7d"),
+                                                    ("30 Tage", "30d"), ("Alles", "all"), ("Von/bis", "custom")]),
                 html.Div(dcc.DatePickerRange(id="dates", display_format="DD.MM.YYYY", first_day_of_week=1,
                                              start_date_placeholder_text="Von", end_date_placeholder_text="Bis"),
                          id="dates-wrap", className="dates-wrap", style={"display": "none"}),
-                _segmented("range", DEFAULT_RANGE, [("6 Std.", "6h"), ("24 Std.", "24h"), ("7 Tage", "7d"),
-                                                    ("30 Tage", "30d"), ("Alles", "all"), ("Von/bis", "custom")]),
                 html.Button([html.Span("↓", className="button-icon", **{"aria-hidden": "true"}), "PDF-Bericht"],
                             id="report-button", className="button", n_clicks=0,
                             title="Störungsprotokoll für den gewählten Zeitraum herunterladen"),
@@ -686,38 +928,60 @@ def create_app(config: Config) -> Dash:
         ], className="topbar"),
         html.Div(id="overview"),
         html.Section([
-            _card_head("Verlauf", dcc.Checklist(id="options", value=[TOGGLE_LOG], className="toggles", inline=True, options=[
-                {"label": "Ping logarithmisch", "value": TOGGLE_LOG}])),
-            dcc.Graph(id="chart", config={"displayModeBar": False, "responsive": True}, figure=empty_figure("Lade …")),
-            html.Div("Ziehen zum Zoomen, Doppelklick setzt zurück. Klick auf einen Legendeneintrag blendet die Strecke "
-                     "aus. Farbige Flächen: Ausfälle, graue Flächen: Messlücken.", className="chart-hint"),
-        ], className="card chart-card"),
+            _card_head("Wann war etwas weg?", note_id="outage-note"),
+            dcc.Graph(id="outage-chart", config=graph_config, figure=empty_figure("Lade …", height=140)),
+            html.Div(id="outage-list", className="outage-wrap"),
+        ], className="card outage-card"),
+        html.Button("Details anzeigen", id="details-button", className="details-button", n_clicks=0),
         html.Div([
             html.Section([
-                _card_head("Je Strecke"),
-                html.Div(id="tracks", className="stats-wrap"),
-                html.Div("Steigt der Verlust erst ab dem Provider-Hop, liegt die Ursache hinter deinem Router. Steigt er "
-                         "schon im Heimnetz, eher beim WLAN oder Router.", className="chart-hint"),
-            ], className="card"),
+                _card_head("Verlauf", dcc.Checklist(id="options", value=[], className="toggles", inline=True,
+                                                    options=[{"label": "Ping logarithmisch", "value": TOGGLE_LOG}])),
+                dcc.Checklist(id="track-pick", value=[INTERNET], className="toggles track-pick", inline=True,
+                              options=[]),
+                dcc.Graph(id="chart", config=graph_config, figure=empty_figure("Lade …")),
+                html.Div("Punkte in Ampelfarbe: Ping über dem Üblichen der Strecke, Dreiecke: Spitzen über dem "
+                         "Achsenende. Verlust: grün bei 0 %, sonst gelb bis rot. Farbige Flächen: Ausfälle, graue: "
+                         "Messlücken. Am PC: Ziehen zoomt, Doppelklick setzt zurück.", className="chart-hint"),
+            ], className="card chart-card"),
+            html.Div([
+                html.Section([
+                    _card_head("Je Strecke"),
+                    html.Div(id="tracks", className="stats-wrap"),
+                    html.Div("Steigt der Verlust erst ab dem Provider-Hop, liegt die Ursache hinter deinem Router. "
+                             "Steigt er schon im Heimnetz, eher beim WLAN oder Router.", className="chart-hint"),
+                ], className="card"),
+                html.Section([
+                    _card_head("Nach Tageszeit", _segmented("heat", HEAT_LOSS, [("Paketverlust", HEAT_LOSS),
+                                                                                 ("Ping P95", HEAT_PING)])),
+                    dcc.Graph(id="heatmap", config=graph_config, figure=empty_figure("Lade …", height=360),
+                              style={"height": "360px"}),
+                    html.Div("Strecke Internet, je Stunde. Grün: kein Verlust bzw. üblicher Ping. Leere Zellen: "
+                             "keine Prüfung.", className="chart-hint"),
+                ], className="card"),
+            ], className="grid-2"),
             html.Section([
-                _card_head("Nach Tageszeit", _segmented("heat", HEAT_LOSS, [("Paketverlust", HEAT_LOSS),
-                                                                             ("Ping P95", HEAT_PING)])),
-                dcc.Graph(id="heatmap", config={"displayModeBar": False, "responsive": True},
-                          figure=empty_figure("Lade …", height=360), style={"height": "360px"}),
-                html.Div("Strecke Internet, je Stunde. Leere Zellen: keine Prüfung.", className="chart-hint"),
-            ], className="card"),
-        ], className="grid-2"),
-        html.Section([
-            _card_head("Ausfälle und Messlücken",
-                       _segmented("table-filter", "outages", [("Ausfälle", "outages"), ("Nur Leitung", "line"),
-                                                              ("Messlücken", "gaps"), ("Alle", "all")]),
-                       note_id="table-count"),
-            html.Div(_table(), className="table-wrap"),
-        ], className="card table-card"),
+                _card_head("Ausfälle und Messlücken",
+                           _segmented("table-filter", "outages", [("Ausfälle", "outages"), ("Nur Leitung", "line"),
+                                                                  ("Messlücken", "gaps"), ("Alle", "all")]),
+                           note_id="table-count"),
+                html.Div(_table(), className="table-wrap"),
+            ], className="card table-card"),
+        ], id="details", className="details", hidden=True),
         dcc.Interval(id="tick", interval=config.dashboard.refresh_s * 1000),
         dcc.Interval(id="live", interval=LIVE_POLL_MS),
         dcc.Store(id="live-state"),
     ], className="shell")
+
+    app.clientside_callback(f"function(_) {{ return window.innerWidth <= {MOBILE_MAX_PX}; }}",
+                            Output("mobile", "data"), Input("url", "pathname"))
+    app.clientside_callback("function(_, open) { return !open; }", Output("details-open", "data"),
+                            Input("details-button", "n_clicks"), State("details-open", "data"),
+                            prevent_initial_call=True)
+    app.clientside_callback(
+        "function(open) { return [!open, open ? 'Details ausblenden' "
+        ": 'Details anzeigen · Ping, Verlust je Strecke, Tageszeit, Tabelle']; }",
+        Output("details", "hidden"), Output("details-button", "children"), Input("details-open", "data"))
 
     @app.callback(Output("dates-wrap", "style"), Input("range", "value"))
     def toggle_dates(choice: str) -> dict[str, str]:
@@ -733,30 +997,61 @@ def create_app(config: Config) -> Dash:
             return no_update
         return no_update if current == previous else current
 
-    @app.callback(
-        Output("chart", "figure"), Output("heatmap", "figure"), Output("overview", "children"),
-        Output("tracks", "children"), Output("table", "data"), Output("table-count", "children"),
-        Input("tick", "n_intervals"), Input("live-state", "data"), Input("range", "value"),
-        Input("dates", "start_date"), Input("dates", "end_date"), Input("options", "value"), Input("heat", "value"),
-        Input("table-filter", "value"),
-    )
-    def refresh(_tick: int | None, _live: str | None, choice: str, custom_start: str | None, custom_end: str | None,
-                options: list[str], heat: str, table_filter: str) -> tuple[Any, ...]:
-        if not Store.exists(config.store_dir):
-            message = "Noch keine Daten. Starte die Messung mit: linkmon run"
-            return empty_figure(message), empty_figure(message, height=360), [], [], [], ""
+    def _view(choice: str, custom_start: str | None, custom_end: str | None, *,
+              all_stats: bool) -> tuple[Store, dict[str, Any], datetime]:
         now = now_utc()
         start, end = _range_bounds(choice, custom_start, custom_end, zone, now)
         store = Store(config.store_dir, readonly=True)
-        view = load_view(config, store, start, end, now)
+        return store, load_view(config, store, start, end, now, all_stats=all_stats), now
+
+    @app.callback(
+        Output("overview", "children"), Output("outage-chart", "figure"), Output("outage-note", "children"),
+        Output("outage-list", "children"),
+        Input("tick", "n_intervals"), Input("live-state", "data"), Input("range", "value"),
+        Input("dates", "start_date"), Input("dates", "end_date"), Input("mobile", "data"),
+    )
+    def refresh(_tick: int | None, _live: str | None, choice: str, custom_start: str | None, custom_end: str | None,
+                mobile: bool | None) -> tuple[Any, ...]:
+        """Das Wichtigste: Zustand, Kacheln und wann etwas ausfiel. Läuft immer."""
+        if not Store.exists(config.store_dir):
+            message = "Noch keine Daten. Starte die Messung mit: linkmon run"
+            return [], empty_figure(message, height=140), "", []
+        store, view, now = _view(choice, custom_start, custom_end, all_stats=False)
         overview = build_overview(store, view["samples"], view["stats"], view["outages"], view["coverage"], config, now)
         # Der Zoom bleibt beim Aktualisieren erhalten und wird erst bei einem neuen Zeitraum zurückgesetzt.
-        revision = f"{choice}-{custom_start}-{custom_end}"
+        revision = f"{choice}-{custom_start}-{custom_end}-{bool(mobile)}"
+        timeline = build_outage_figure(view["outages"], view["gaps"], view["start"], view["end"], zone,
+                                       mobile=bool(mobile), revision=revision)
+        return overview, timeline, outage_summary(view["outages"]), outage_list(view["outages"], zone)
+
+    @app.callback(
+        Output("chart", "figure"), Output("heatmap", "figure"), Output("tracks", "children"),
+        Output("table", "data"), Output("table-count", "children"), Output("track-pick", "options"),
+        Output("heatmap", "style"),
+        Input("tick", "n_intervals"), Input("live-state", "data"), Input("range", "value"),
+        Input("dates", "start_date"), Input("dates", "end_date"), Input("details-open", "data"),
+        Input("options", "value"), Input("track-pick", "value"), Input("heat", "value"),
+        Input("table-filter", "value"), Input("mobile", "data"),
+    )
+    def refresh_details(_tick: int | None, _live: str | None, choice: str, custom_start: str | None,
+                        custom_end: str | None, open_: bool | None, options: list[str], picked: list[str],
+                        heat: str, table_filter: str, mobile: bool | None) -> tuple[Any, ...]:
+        """Verläufe, Strecken, Tageszeit und Tabelle: nur berechnet und übertragen, wenn aufgeklappt."""
+        if not open_:
+            raise PreventUpdate
+        if not Store.exists(config.store_dir):
+            message = "Noch keine Daten. Starte die Messung mit: linkmon run"
+            return empty_figure(message), empty_figure(message, height=360), [], [], "", [], no_update
+        _, view, _ = _view(choice, custom_start, custom_end, all_stats=True)
+        mobile = bool(mobile)
+        revision = f"{choice}-{custom_start}-{custom_end}-{mobile}"
         figure = build_figure(view["samples"], view["outages"], view["gaps"], view["start"], view["end"], zone,
-                              log_latency=TOGGLE_LOG in options, revision=revision)
-        heatmap = build_heatmap(view["samples"], view["start"], view["end"], zone, heat)
+                              selected=picked or [], log_latency=TOGGLE_LOG in (options or []), mobile=mobile,
+                              revision=revision)
+        heatmap = build_heatmap(view["samples"], view["start"], view["end"], zone, heat, mobile=mobile)
         rows = filter_rows(table_rows(view["outages"], view["gaps"], zone), table_filter)
-        return figure, heatmap, overview, track_table(view["stats"], view["samples"]), rows, f"{len(rows)} Einträge"
+        return (figure, heatmap, track_table(view["stats"], view["samples"]), rows, f"{len(rows)} Einträge",
+                track_options(view["samples"]), {"height": f"{heatmap.layout.height}px"})
 
     @app.callback(
         Output("report-download", "data"), Output("report-status", "children"),

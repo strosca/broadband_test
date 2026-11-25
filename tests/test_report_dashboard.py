@@ -13,12 +13,20 @@ from linkmon.dashboard import (
     HEAT_PING,
     KIND_GAP,
     _band,
+    SEVERITY_FLOOR,
     _range_bounds,
     build_figure,
+    build_outage_figure,
     build_heatmap,
     create_app,
     filter_rows,
     load_view,
+    loss_severity,
+    outage_list,
+    outage_summary,
+    ping_limits,
+    ping_severity,
+    severity_tone,
     table_rows,
     track_table,
 )
@@ -104,27 +112,77 @@ def _view(config: Config, store: Store, start: datetime, end: datetime):
     return load_view(config, store, start, end, end, cache=None)
 
 
-def test_dashboard_figure_has_timeline_ping_and_loss(config: Config, seeded: tuple[Store, datetime, datetime]) -> None:
+def test_outage_figure_marks_every_outage_and_gap(config: Config, seeded: tuple[Store, datetime, datetime]) -> None:
     store, start, end = seeded
     view = _view(config, store, start, end)
-    figure = build_figure(view["samples"], view["outages"], view["gaps"], view["start"], view["end"], config.zone)
+    figure = build_outage_figure(view["outages"], view["gaps"], view["start"], view["end"], config.zone)
     names = {trace.name for trace in figure.data}
     assert {"Leitung (Vodafone)", "Router/LAN", "Nur DNS", KIND_GAP} <= names
-    assert {"Internet (1.1.1.1, 8.8.8.8)", "Provider-Hop 92.79.214.24", "Heimnetz 192.168.0.1"} <= names
-    timeline = next(trace for trace in figure.data if trace.name == "Leitung (Vodafone)")
-    assert "Dauer 00:30:00" in timeline.hovertext[0]
-    loss = [trace for trace in figure.data if trace.yaxis == "y3"]
-    assert len(loss) == 3  # DNS und HTTPS sind keine Pings und fehlen im Verlauf.
+    marks = next(trace for trace in figure.data if trace.name == "Leitung (Vodafone)")
+    assert marks.mode == "markers" and "Dauer 30 min" in marks.hovertext[0]
+    # Grün nur, wo gemessen wurde: Die eingebaute Lücke unterbricht die Zeile.
+    ok = next(trace for trace in figure.data if trace.name == "Leitung (Vodafone) ok")
+    assert list(ok.x).count(None) == 2
+
+
+def test_outage_figure_is_compact_and_static_on_mobile(config: Config) -> None:
+    start = datetime(2026, 11, 1, tzinfo=config.zone)
+    end = start + timedelta(days=1)
+    figure = build_outage_figure([], [], start, end, config.zone, mobile=True)
+    assert figure.layout.dragmode is False
+    assert figure.layout.xaxis.fixedrange is True
+    assert list(figure.layout.yaxis.categoryarray) == ["Leitung"]  # Leitung steht immer da, auch ohne Ausfall.
+
+
+def test_detail_figure_shows_chosen_tracks_only(config: Config, seeded: tuple[Store, datetime, datetime]) -> None:
+    store, start, end = seeded
+    view = _view(config, store, start, end)
+    args = (view["samples"], view["outages"], view["gaps"], view["start"], view["end"], config.zone)
+    figure = build_figure(*args)
+    lines = {trace.name for trace in figure.data if trace.type == "scatter" and trace.mode == "lines" and trace.name}
+    assert lines == {"Internet (1.1.1.1, 8.8.8.8)"}
+    strips = [trace for trace in figure.data if trace.type == "heatmap"]
+    assert len(strips) == 1
+    figure = build_figure(*args, selected=["internet", "lan:192.168.0.1"])
+    assert len([trace for trace in figure.data if trace.type == "heatmap"]) == 2
+    # Abends steigt der Ping von 21 auf 61 ms: Diese Punkte tragen die Ampelfarbe.
+    raised = next(trace for trace in figure.data if trace.name == "Internet (1.1.1.1, 8.8.8.8) erhöht")
+    assert min(raised.marker.color) > 0
     rects = [shape for shape in figure.layout.shapes if shape.type == "rect"]
-    assert len(rects) == 2 * (3 + len(view["gaps"]))
+    assert len(rects) >= 3 + len(view["gaps"])
 
 
 def test_dashboard_ping_axis_switches(config: Config, seeded: tuple[Store, datetime, datetime]) -> None:
     store, start, end = seeded
     view = _view(config, store, start, end)
     args = (view["samples"], view["outages"], view["gaps"], view["start"], view["end"], config.zone)
-    assert build_figure(*args).layout.yaxis2.type != "log"
-    assert build_figure(*args, log_latency=True).layout.yaxis2.type == "log"
+    linear = build_figure(*args).layout.yaxis
+    assert linear.type != "log" and linear.range[1] >= 61  # Die Abendwerte passen auf die Achse.
+    assert build_figure(*args, log_latency=True).layout.yaxis.type == "log"
+
+
+def test_severity_keeps_zero_green_and_separates_small_values() -> None:
+    assert float(loss_severity(0)) == 0
+    assert float(loss_severity(0.01)) == SEVERITY_FLOOR  # Jeder Verlust ist sichtbar nicht grün.
+    assert float(loss_severity(0.4)) > float(loss_severity(0.05)) + 0.3
+    assert float(loss_severity(50)) == 1
+    good, bad = ping_limits(17)
+    assert 20 < good < 30 and bad >= 90
+    assert float(ping_severity(20, good, bad)) == 0
+    assert float(ping_severity(80, good, bad)) > 0.7
+    assert severity_tone(0.0) == "tone-ok" and severity_tone(0.9) == "tone-bad"
+
+
+def test_outage_list_is_newest_first_and_capped(config: Config) -> None:
+    from linkmon.stats import Outage
+
+    start = datetime(2026, 11, 1, tzinfo=config.zone)
+    outages = [Outage("line", "weg", start + timedelta(minutes=i), start + timedelta(minutes=i, seconds=4), True)
+               for i in range(12)]
+    text = str(outage_list(outages, config.zone, limit=8))
+    assert "4 s" in text and "und 4 weitere" in text
+    assert text.index("00:11:00") < text.index("00:10:00")
+    assert outage_summary(outages) == "12× Leitung · Leitung zusammen 48 s"
 
 
 def test_band_does_not_bridge_gaps() -> None:

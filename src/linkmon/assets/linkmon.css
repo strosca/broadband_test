@@ -282,9 +282,94 @@ html, body {
 .table-wrap .previous-next-container input { background: var(--surface-raised) !important; color: var(--ink) !important; border: 1px solid var(--line); border-radius: 5px; }
 .table-wrap .previous-next-container .current-page-container .current-page-shadow { color: var(--ink); }
 
+/* Ampel: Kacheln, Tabelle */
+:root { --ok: #2f9e44; --warn: #e3c23b; --bad: #e5484d; }
+.kpi-label { display: flex; align-items: center; gap: 7px; }
+.kpi-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: transparent; }
+.kpi.tone-ok .kpi-dot { background: var(--ok); }
+.kpi.tone-warn .kpi-dot { background: var(--warn); }
+.kpi.tone-bad .kpi-dot { background: var(--bad); }
+.kpi.tone-none .kpi-dot { display: none; }
+.cell-tone.tone-ok { color: #6fcf86; }
+.cell-tone.tone-warn { color: var(--warn); }
+.cell-tone.tone-bad { color: #ff7b7f; }
+
+/* Ausfälle: Zeitleiste und Liste */
+.outage-card { margin-bottom: 12px; padding-bottom: 10px; }
+.outage-wrap { padding: 4px 20px 6px; }
+.outage-empty { color: var(--ink-3); font-size: 13px; padding: 4px 0 6px; }
+.outage-list { list-style: none; margin: 0; padding: 0; }
+.outage-item { display: flex; gap: 12px; padding: 10px 0; border-top: 1px solid var(--grid); }
+.outage-mark { flex: none; width: 4px; border-radius: 2px; }
+.outage-body { min-width: 0; flex: 1; }
+.outage-top { display: flex; justify-content: space-between; gap: 12px; font-size: 14px; }
+.outage-level { font-weight: 600; }
+.outage-duration { color: var(--ink); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.outage-duration.is-live { color: var(--bad); font-weight: 600; }
+.outage-time { color: var(--ink-2); font-size: 12px; font-variant-numeric: tabular-nums; }
+.outage-detail { color: var(--ink-3); font-size: 12px; margin-top: 2px; }
+.outage-more { color: var(--ink-3); font-size: 12px; padding-top: 8px; border-top: 1px solid var(--grid); }
+
+/* Details auf Nachfrage */
+.details-button {
+  display: block;
+  width: 100%;
+  margin-bottom: 12px;
+  padding: 13px 16px;
+  border: 1px dashed rgba(255, 255, 255, 0.18);
+  border-radius: 14px;
+  background: transparent;
+  color: var(--ink-2);
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+}
+.details-button:hover { color: var(--ink); border-color: var(--accent); }
+.details-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.track-pick { padding: 2px 20px 0; }
+.track-pick .swatch { display: inline-block; margin-right: 7px; vertical-align: -1px; }
+
 @media (max-width: 720px) {
-  .shell { padding: 0 14px 28px; }
-  .topbar { position: static; }
-  .hero { padding: 16px; }
+  html, body { font-size: 15px; }
+  .shell { padding: 0 10px 28px; }
+  .topbar { position: static; padding: 10px 0; gap: 8px; }
+  .brand-mark { width: 26px; height: 26px; font-size: 15px; border-radius: 7px; }
+  .controls { width: 100%; gap: 8px; }
+  /* Zeitraum in einer Zeile, bei Bedarf seitlich wischen statt umbrechen */
+  /* Zeitraum als 3×2-Raster: alles sichtbar, große Tippflächen */
+  .controls > .segmented { flex: 1 1 100%; display: grid; grid-template-columns: repeat(3, 1fr); gap: 2px; }
+  .controls > .segmented label { justify-content: center; }
+  .segmented label { padding: 8px 10px; font-size: 14px; }
+  .button { padding: 7px 12px; }
+  .report-status:empty { display: none; }
+
+  .hero { padding: 14px; gap: 14px; margin-bottom: 10px; }
+  .hero-main { min-width: 0; gap: 12px; }
+  .hero-badge { width: 40px; height: 40px; font-size: 20px; }
   .hero-title { font-size: 20px; }
+  .hero-facts { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; width: 100%; }
+  .fact-value { font-size: 14px; }
+
+  .kpis { grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px; }
+  .kpis > .kpi:first-child { grid-column: 1 / -1; }
+  .kpi { padding: 12px 14px; }
+  .kpi-label { font-size: 12px; }
+  .kpi-value { font-size: 26px; }
+  .kpi-note { font-size: 11px; margin-top: 3px; }
+
+  .card-head { padding: 12px 14px 4px; }
+  .outage-wrap { padding: 2px 14px 4px; }
+  .chart-hint { padding: 0 14px 8px; }
+  .track-pick { padding: 2px 14px 0; }
+  .stats-wrap { padding: 4px 14px 6px; }
+  .table-wrap { padding: 8px 10px 0; }
+  .grid-2 { gap: 10px; margin-bottom: 10px; }
+  /* Streckennamen bleiben beim seitlichen Wischen stehen */
+  .stats-table td:first-child, .stats-table th:first-child {
+    position: sticky; left: 0; z-index: 1; background: var(--surface); padding-right: 10px;
+  }
+  .toggles label { padding: 6px 11px; font-size: 13px; }
+  /* Tabelle: nicht umbrechen, seitlich wischen; Filterzeile braucht am Handy niemand */
+  .table-wrap .dash-cell, .table-wrap .dash-header { white-space: nowrap !important; }
+  .table-wrap .dash-filter { display: none; }
 }
