@@ -310,6 +310,34 @@ html, body {
 .outage-detail { color: var(--ink-3); font-size: 12px; margin-top: 2px; }
 .outage-more { color: var(--ink-3); font-size: 12px; padding-top: 8px; border-top: 1px solid var(--grid); }
 
+/* Zeitleiste der Ausfälle (reines HTML) */
+.timeline-wrap { padding: 8px 20px 10px; }
+.timeline { display: grid; gap: 10px; }
+.tl-row { display: grid; grid-template-columns: 150px 1fr; align-items: center; gap: 12px; }
+.tl-label { color: var(--ink-2); font-size: 13px; text-align: right; white-space: nowrap; }
+.tl-short { display: none; }
+.tl-track { position: relative; height: 18px; border-radius: 4px; background: var(--surface-raised); overflow: hidden; }
+.tl-ok { position: absolute; top: 5px; bottom: 5px; background: rgba(47, 158, 68, 0.55); }
+/* Mindestbreite: Aussetzer von Sekunden bleiben auch bei 30 Tagen sichtbar */
+.tl-hit { position: absolute; top: 0; bottom: 0; min-width: 3px; border-radius: 1px; }
+.tl-gap { background: #6a6964; }
+.tl-axis-row { gap: 12px; }
+.tl-axis { position: relative; height: 30px; border-top: 1px solid var(--line); }
+.tl-tick {
+  position: absolute;
+  top: 4px;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  color: var(--ink-3);
+  font-size: 11px;
+  line-height: 1.25;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.tl-tick::before { content: ""; position: absolute; top: -5px; left: 50%; width: 1px; height: 4px; background: var(--ink-3); }
+
 /* Details auf Nachfrage */
 .details-button {
   display: block;
@@ -359,6 +387,12 @@ html, body {
 
   .card-head { padding: 12px 14px 4px; }
   .outage-wrap { padding: 2px 14px 4px; }
+  .timeline-wrap { padding: 6px 14px 8px; }
+  .tl-row { grid-template-columns: 62px 1fr; gap: 8px; }
+  .tl-short { display: inline; }
+  .tl-long { display: none; }
+  .tl-track { height: 22px; }
+  .tl-ok { top: 7px; bottom: 7px; }
   .chart-hint { padding: 0 14px 8px; }
   .track-pick { padding: 2px 14px 0; }
   .stats-wrap { padding: 4px 14px 6px; }

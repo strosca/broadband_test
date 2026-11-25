@@ -82,7 +82,7 @@ _CACHE = SampleCache()
 # Unterhalb dieser Breite gilt die Seite als Handyansicht: kompakte Grafiken, kein Ziehen zum Zoomen.
 MOBILE_MAX_PX = 720
 SHORT_LEVEL_LABELS = {"line": "Leitung", "router": "Router", "local": "Lokal", "dns_home": "Pi-hole",
-                      "dns": "DNS", "https": "HTTPS"}
+                      "dns": "DNS", "https": "HTTPS", KIND_GAP: "Lücke"}
 OUTAGE_LIST_LIMIT = 8
 
 
@@ -213,14 +213,6 @@ def _timeline_rows(outages: list[Outage], gaps: list[tuple[datetime, datetime]])
     return rows
 
 
-def _segments(intervals: list[tuple[datetime, datetime]], row: str, zone: ZoneInfo,
-              minimum: timedelta) -> tuple[list[Any], list[Any]]:
-    xs: list[Any] = []
-    for begin, finish in intervals:
-        xs += [_naive(begin, zone), _naive(max(finish, begin + minimum), zone), None]
-    return xs, [row if x is not None else None for x in xs]
-
-
 def _covered(start: datetime, end: datetime, gaps: list[tuple[datetime, datetime]]) -> list[tuple[datetime, datetime]]:
     """Zeit, in der gemessen wurde: der Zeitraum ohne die Messlücken."""
     pieces: list[tuple[datetime, datetime]] = []
@@ -240,61 +232,76 @@ def _outage_text(outage: Outage, zone: ZoneInfo) -> str:
             f"Dauer {short_duration(outage.duration_s)}{suffix}<br>{outage.detail}")
 
 
-def build_outage_figure(outages: list[Outage], gaps: list[tuple[datetime, datetime]], start: datetime,
-                        end: datetime, zone: ZoneInfo, *, mobile: bool = False,
-                        revision: str = "linkmon") -> go.Figure:
-    """Wann war was weg: je Ebene eine Zeile, grün solange gemessen wurde und alles lief.
+# Mögliche Abstände der Zeitachse, gewählt wird der kleinste mit höchstens TIMELINE_TICKS Marken.
+TICK_STEPS_H = (1, 2, 3, 6, 12, 24, 48, 96, 168, 336, 720, 1440, 2880)
+TIMELINE_TICKS = 4
 
-    Ausfälle von wenigen Sekunden wären bei 24 Stunden schmaler als ein Pixel. Deshalb bekommt jeder
-    Ausfall zusätzlich einen senkrechten Strich in voller Zeilenhöhe, der immer sichtbar bleibt.
+
+def _timeline_ticks(start: datetime, end: datetime, zone: ZoneInfo) -> list[tuple[float, str]]:
+    span_h = max((end - start).total_seconds() / 3600, 1 / 60)
+    step = next((hours for hours in TICK_STEPS_H if span_h / hours <= TIMELINE_TICKS), TICK_STEPS_H[-1])
+    local = start.astimezone(zone)
+    first = local.replace(minute=0, second=0, microsecond=0)
+    if step >= 24:
+        first = first.replace(hour=0)
+    else:
+        first = first.replace(hour=first.hour - first.hour % step)
+    ticks = []
+    moment = first
+    while moment <= end:
+        share = 100 * (moment - start).total_seconds() / (end - start).total_seconds()
+        if 4 <= share <= 96:  # Am Rand würde die Beschriftung über die Leiste hinausragen.
+            text = f"{moment:%d.%m.}" if step >= 24 else f"{moment:%H:%M}\n{moment:%d.%m.}"
+            ticks.append((share, text))
+        # Über die Zeitzone rechnen, damit Marken bei der Zeitumstellung auf runden Stunden bleiben.
+        moment = (moment.astimezone(UTC) + timedelta(hours=step)).astimezone(zone)
+    return ticks
+
+
+def outage_timeline(outages: list[Outage], gaps: list[tuple[datetime, datetime]], start: datetime,
+                    end: datetime, zone: ZoneInfo) -> html.Div:
+    """Wann war was weg, als reines HTML: kommt mit der ersten Antwort und braucht kein Plotly.
+
+    Je Ebene eine Zeile, grün solange gemessen wurde. Jeder Ausfall ist mindestens 3 Pixel breit, damit auch
+    Aussetzer von Sekunden bei 30 Tagen sichtbar bleiben. Details beim Darüberfahren und in der Liste darunter.
     """
-    rows = _timeline_rows(outages, gaps)
-    labels = {row: (SHORT_LEVEL_LABELS.get(row, row) if mobile else LEVEL_LABELS.get(row, row)) for row in rows}
-    figure = go.Figure()
-    span = end - start
-    minimum = max(span * 0.002, timedelta(seconds=1))
+    total = max((end - start).total_seconds(), 1.0)
+
+    def place(begin: datetime, finish: datetime) -> dict[str, str]:
+        left = max(0.0, (begin - start).total_seconds() / total * 100)
+        right = min(100.0, (finish - start).total_seconds() / total * 100)
+        return {"left": f"{left:.3f}%", "width": f"{max(right - left, 0):.3f}%"}
+
     covered = _covered(start, end, gaps)
-    for row in rows:
+    rows = []
+    for row in _timeline_rows(outages, gaps):
+        marks: list[Any] = []
         if row == KIND_GAP:
-            continue
-        xs, ys = _segments(covered, labels[row], zone, timedelta(0))
-        figure.add_trace(go.Scatter(x=xs, y=ys, mode="lines", line={"color": _transparent(COLOR_OK, 0.55), "width": 10},
-                                    hoverinfo="skip", showlegend=False, name=f"{labels[row]} ok"))
-    for row in rows:
-        if row == KIND_GAP:
-            intervals = gaps
-            color = COLOR_GAP
-            texts = [f"<b>Messlücke</b> (Tool lief nicht)<br>{format_local(b, zone)}<br>Dauer "
-                     f"{short_duration((f - b).total_seconds())}" for b, f in gaps]
+            label = KIND_GAP
+            for begin, finish in gaps:
+                marks.append(html.Div(className="tl-hit tl-gap", style=place(begin, finish),
+                                      title=f"Messlücke {begin.astimezone(zone):%d.%m. %H:%M}, "
+                                            f"{short_duration((finish - begin).total_seconds())}"))
         else:
-            items = [outage for outage in outages if outage.level == row]
-            intervals = [(outage.start, outage.end) for outage in items]
+            label = LEVEL_LABELS.get(row, row)
+            marks += [html.Div(className="tl-ok", style=place(begin, finish)) for begin, finish in covered]
             color = LEVEL_COLORS_DARK.get(row, COLOR_INK_2)
-            texts = [_outage_text(outage, zone) for outage in items]
-        if not intervals:
-            continue
-        name = KIND_GAP if row == KIND_GAP else LEVEL_LABELS.get(row, row)
-        xs, ys = _segments(intervals, labels[row], zone, minimum)
-        figure.add_trace(go.Scatter(x=xs, y=ys, mode="lines", line={"color": color, "width": 16}, hoverinfo="skip",
-                                    showlegend=False, name=name + " Dauer", connectgaps=False))
-        middles = [_naive(begin + (finish - begin) / 2, zone) for begin, finish in intervals]
-        figure.add_trace(go.Scatter(
-            x=middles, y=[labels[row]] * len(middles), mode="markers", name=name, showlegend=False,
-            marker={"symbol": "line-ns", "size": 22, "line": {"width": 3, "color": color}},
-            hovertext=texts, hoverinfo="text",
-        ))
-    height = (44 if mobile else 40) * len(rows) + (58 if mobile else 50)
-    figure.update_layout(height=height, margin={"l": 8, "r": 12 if mobile else 20, "t": 6, "b": 8},
-                         uirevision=revision, showlegend=False, **_interaction(mobile), **_base_layout())
-    _time_axes(figure, mobile)
-    figure.update_xaxes(range=[_naive(start, zone), _naive(end, zone)], fixedrange=mobile, showline=True)
-    figure.update_yaxes(type="category", categoryorder="array", categoryarray=[labels[row] for row in rows],
-                        autorange="reversed", showgrid=False, fixedrange=True, ticks="",
-                        ticklabelstandoff=8, tickfont={"size": 12, "color": COLOR_INK_2})
-    if not outages:
-        figure.add_annotation(text="Keine Ausfälle im Zeitraum", xref="paper", yref="paper", x=0.5, y=1,
-                              yanchor="top", showarrow=False, font={"color": COLOR_INK_3, "size": 11})
-    return figure
+            for outage in (item for item in outages if item.level == row):
+                marks.append(html.Div(
+                    className="tl-hit", style={**place(outage.start, outage.end), "background": color},
+                    title=f"{label} {outage.start.astimezone(zone):%d.%m. %H:%M:%S}, "
+                          f"{short_duration(outage.duration_s)}"))
+        rows.append(html.Div([
+            html.Div([html.Span(SHORT_LEVEL_LABELS.get(row, row), className="tl-short"),
+                      html.Span(label, className="tl-long")], className="tl-label"),
+            html.Div(marks, className="tl-track"),
+        ], className="tl-row", **{"data-row": row}))
+    axis = html.Div([html.Div([html.Span(line) for line in text.split("\n")], className="tl-tick",
+                              style={"left": f"{share:.3f}%"})
+                     for share, text in _timeline_ticks(start, end, zone)], className="tl-axis")
+    rows.append(html.Div([html.Div(className="tl-label"), axis], className="tl-row tl-axis-row"))
+    return html.Div(rows, className="timeline", role="img",
+                    **{"aria-label": "Zeitleiste der Ausfälle: " + outage_summary(outages)})
 
 
 def outage_summary(outages: list[Outage]) -> str:
@@ -812,6 +819,16 @@ def listen_urls(host: str, port: int) -> list[str]:
     return [f"http://{address}:{port}" for address in sorted(set(addresses))] + [f"http://{hostname}:{port}"]
 
 
+def warm_cache(config: Config) -> None:
+    """Liest die Messdateien der letzten 31 Tage schon beim Start, nicht erst beim ersten Seitenaufruf."""
+    try:
+        if Store.exists(config.store_dir):
+            now = now_utc()
+            load_samples(Store(config.store_dir, readonly=True), now - timedelta(days=31), now, _CACHE)
+    except Exception:  # Nur eine Beschleunigung: Fehler zeigen sich beim ersten Abruf ohnehin.
+        logging.getLogger(__name__).debug("Vorwärmen fehlgeschlagen", exc_info=True)
+
+
 def make_web_server(config: Config, host: str, port: int) -> Any:
     """Ein richtiger Webserver (waitress) statt des Entwicklungsservers von Flask.
 
@@ -821,6 +838,7 @@ def make_web_server(config: Config, host: str, port: int) -> Any:
 
     logging.getLogger("waitress").setLevel(logging.WARNING)  # Sonst füllt jeder Abruf das Log.
     app = create_app(config)
+    threading.Thread(target=warm_cache, args=(config,), name="web-cache", daemon=True).start()
     return create_server(app.server, host="0.0.0.0" if host in ALL_INTERFACES else host, port=port,
                          threads=WEB_THREADS, ident="linkmon")
 
@@ -899,41 +917,17 @@ def _internet_stats(samples: pd.DataFrame) -> list[TrackStats]:
 
 
 def create_app(config: Config) -> Dash:
-    app = Dash(__name__, title="Verfügbarkeit", update_title=None,
-               meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"},
+    # compress: Die Skripte von Dash sind unkomprimiert über 2 MB groß, gzip spart am Handy Sekunden.
+    # suppress_callback_exceptions: Die Details werden erst beim Aufklappen eingehängt.
+    app = Dash(__name__, title="Verfügbarkeit", update_title=None, compress=True,
+               suppress_callback_exceptions=True, meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"},
                           {"name": "theme-color", "content": "#0d0d0d"}])
     zone = config.zone
     graph_config = {"displayModeBar": False, "responsive": True, "scrollZoom": False}
-    app.layout = html.Div([
-        dcc.Location(id="url"),
-        dcc.Store(id="mobile"),
-        # Pro Browser gemerkt: Am PC bleiben die Details offen, am Handy zu, wenn man es so eingestellt hat.
-        dcc.Store(id="details-open", storage_type="local", data=False),
-        html.Header([
-            html.Div([html.Div("↯", className="brand-mark", **{"aria-hidden": "true"}),
-                      html.Div("Verfügbarkeit", className="brand-title")], className="brand"),
-            html.Div([
-                _segmented("range", DEFAULT_RANGE, [("6 Std.", "6h"), ("24 Std.", "24h"), ("7 Tage", "7d"),
-                                                    ("30 Tage", "30d"), ("Alles", "all"), ("Von/bis", "custom")]),
-                html.Div(dcc.DatePickerRange(id="dates", display_format="DD.MM.YYYY", first_day_of_week=1,
-                                             start_date_placeholder_text="Von", end_date_placeholder_text="Bis"),
-                         id="dates-wrap", className="dates-wrap", style={"display": "none"}),
-                html.Button([html.Span("↓", className="button-icon", **{"aria-hidden": "true"}), "PDF-Bericht"],
-                            id="report-button", className="button", n_clicks=0,
-                            title="Störungsprotokoll für den gewählten Zeitraum herunterladen"),
-                dcc.Loading(html.Div(id="report-status", className="report-status", role="status"), type="dot",
-                            color="#3987e5", delay_show=150),
-                dcc.Download(id="report-download"),
-            ], className="controls"),
-        ], className="topbar"),
-        html.Div(id="overview"),
-        html.Section([
-            _card_head("Wann war etwas weg?", note_id="outage-note"),
-            dcc.Graph(id="outage-chart", config=graph_config, figure=empty_figure("Lade …", height=140)),
-            html.Div(id="outage-list", className="outage-wrap"),
-        ], className="card outage-card"),
-        html.Button("Details anzeigen", id="details-button", className="details-button", n_clicks=0),
-        html.Div([
+    def details_layout() -> list[Any]:
+        """Verläufe, Strecken, Tageszeit, Tabelle. Erst beim Aufklappen eingehängt: Vorher lädt der Browser
+        weder Plotly (4,7 MB) noch die Tabellenkomponente."""
+        return [
             html.Section([
                 _card_head("Verlauf", dcc.Checklist(id="options", value=[], className="toggles", inline=True,
                                                     options=[{"label": "Ping logarithmisch", "value": TOGGLE_LOG}])),
@@ -967,11 +961,59 @@ def create_app(config: Config) -> Dash:
                            note_id="table-count"),
                 html.Div(_table(), className="table-wrap"),
             ], className="card table-card"),
-        ], id="details", className="details", hidden=True),
-        dcc.Interval(id="tick", interval=config.dashboard.refresh_s * 1000),
-        dcc.Interval(id="live", interval=LIVE_POLL_MS),
-        dcc.Store(id="live-state"),
-    ], className="shell")
+        ]
+
+    def initial_state() -> tuple[list[Any], Any, str, Any, str | None]:
+        """Die Werte für 24 Stunden gleich in die erste Antwort, ohne zweiten Abruf."""
+        if not Store.exists(config.store_dir):
+            return [], html.Div(), "", html.Div("Noch keine Daten. Starte die Messung mit: linkmon run",
+                                                 className="outage-empty"), None
+        try:
+            parts = main_view(DEFAULT_RANGE, None, None)
+            signature = live_signature(Store(config.store_dir, readonly=True))
+        except (OSError, ValueError):  # Datei wird gerade geschrieben: Die Seite füllt sich beim nächsten Abruf.
+            return [], html.Div(), "Lade …", html.Div(), None
+        return (*parts, signature)
+
+    def serve_layout() -> html.Div:
+        overview, timeline, note, listing, signature = initial_state()
+        return html.Div([
+            dcc.Location(id="url"),
+            dcc.Store(id="mobile"),
+            # Pro Browser gemerkt: Am PC bleiben die Details offen, am Handy zu, wenn man es so eingestellt hat.
+            dcc.Store(id="details-open", storage_type="local", data=False),
+            html.Header([
+                html.Div([html.Div("↯", className="brand-mark", **{"aria-hidden": "true"}),
+                          html.Div("Verfügbarkeit", className="brand-title")], className="brand"),
+                html.Div([
+                    _segmented("range", DEFAULT_RANGE, [("6 Std.", "6h"), ("24 Std.", "24h"), ("7 Tage", "7d"),
+                                                        ("30 Tage", "30d"), ("Alles", "all"), ("Von/bis", "custom")]),
+                    html.Div(dcc.DatePickerRange(id="dates", display_format="DD.MM.YYYY", first_day_of_week=1,
+                                                 start_date_placeholder_text="Von", end_date_placeholder_text="Bis"),
+                             id="dates-wrap", className="dates-wrap", style={"display": "none"}),
+                    html.Button([html.Span("↓", className="button-icon", **{"aria-hidden": "true"}), "PDF-Bericht"],
+                                id="report-button", className="button", n_clicks=0,
+                                title="Störungsprotokoll für den gewählten Zeitraum herunterladen"),
+                    dcc.Loading(html.Div(id="report-status", className="report-status", role="status"), type="dot",
+                                color="#3987e5", delay_show=150),
+                    dcc.Download(id="report-download"),
+                ], className="controls"),
+            ], className="topbar"),
+            html.Div(overview, id="overview"),
+            html.Section([
+                html.Div([html.Div([html.H2("Wann war etwas weg?", className="card-title"),
+                                    html.Div(note, id="outage-note", className="card-note")])], className="card-head"),
+                html.Div(timeline, id="outage-timeline", className="timeline-wrap"),
+                html.Div(listing, id="outage-list", className="outage-wrap"),
+            ], className="card outage-card"),
+            html.Button("Details anzeigen", id="details-button", className="details-button", n_clicks=0),
+            html.Div(id="details", className="details", hidden=True),
+            dcc.Interval(id="tick", interval=config.dashboard.refresh_s * 1000),
+            dcc.Interval(id="live", interval=LIVE_POLL_MS),
+            dcc.Store(id="live-state", data=signature),
+        ], className="shell")
+
+    app.layout = serve_layout  # Funktion: bei jedem Seitenaufruf frisch berechnet
 
     app.clientside_callback(f"function(_) {{ return window.innerWidth <= {MOBILE_MAX_PX}; }}",
                             Output("mobile", "data"), Input("url", "pathname"))
@@ -997,6 +1039,12 @@ def create_app(config: Config) -> Dash:
             return no_update
         return no_update if current == previous else current
 
+    def main_view(choice: str, custom_start: str | None, custom_end: str | None) -> tuple[Any, ...]:
+        store, view, now = _view(choice, custom_start, custom_end, all_stats=False)
+        overview = build_overview(store, view["samples"], view["stats"], view["outages"], view["coverage"], config, now)
+        timeline = outage_timeline(view["outages"], view["gaps"], view["start"], view["end"], zone)
+        return overview, timeline, outage_summary(view["outages"]), outage_list(view["outages"], zone)
+
     def _view(choice: str, custom_start: str | None, custom_end: str | None, *,
               all_stats: bool) -> tuple[Store, dict[str, Any], datetime]:
         now = now_utc()
@@ -1005,24 +1053,22 @@ def create_app(config: Config) -> Dash:
         return store, load_view(config, store, start, end, now, all_stats=all_stats), now
 
     @app.callback(
-        Output("overview", "children"), Output("outage-chart", "figure"), Output("outage-note", "children"),
+        Output("overview", "children"), Output("outage-timeline", "children"), Output("outage-note", "children"),
         Output("outage-list", "children"),
         Input("tick", "n_intervals"), Input("live-state", "data"), Input("range", "value"),
-        Input("dates", "start_date"), Input("dates", "end_date"), Input("mobile", "data"),
+        Input("dates", "start_date"), Input("dates", "end_date"), prevent_initial_call=True,
     )
-    def refresh(_tick: int | None, _live: str | None, choice: str, custom_start: str | None, custom_end: str | None,
-                mobile: bool | None) -> tuple[Any, ...]:
-        """Das Wichtigste: Zustand, Kacheln und wann etwas ausfiel. Läuft immer."""
+    def refresh(_tick: int | None, _live: str | None, choice: str, custom_start: str | None,
+                custom_end: str | None) -> tuple[Any, ...]:
+        """Das Wichtigste: Zustand, Kacheln und wann etwas ausfiel. Der erste Stand kommt schon mit der Seite."""
         if not Store.exists(config.store_dir):
-            message = "Noch keine Daten. Starte die Messung mit: linkmon run"
-            return [], empty_figure(message, height=140), "", []
-        store, view, now = _view(choice, custom_start, custom_end, all_stats=False)
-        overview = build_overview(store, view["samples"], view["stats"], view["outages"], view["coverage"], config, now)
-        # Der Zoom bleibt beim Aktualisieren erhalten und wird erst bei einem neuen Zeitraum zurückgesetzt.
-        revision = f"{choice}-{custom_start}-{custom_end}-{bool(mobile)}"
-        timeline = build_outage_figure(view["outages"], view["gaps"], view["start"], view["end"], zone,
-                                       mobile=bool(mobile), revision=revision)
-        return overview, timeline, outage_summary(view["outages"]), outage_list(view["outages"], zone)
+            return [], html.Div(), "", html.Div("Noch keine Daten. Starte die Messung mit: linkmon run",
+                                                 className="outage-empty")
+        return main_view(choice, custom_start, custom_end)
+
+    @app.callback(Output("details", "children"), Input("details-open", "data"), State("details", "children"))
+    def mount_details(open_: bool | None, children: Any) -> Any:
+        return details_layout() if open_ and not children else no_update
 
     @app.callback(
         Output("chart", "figure"), Output("heatmap", "figure"), Output("tracks", "children"),

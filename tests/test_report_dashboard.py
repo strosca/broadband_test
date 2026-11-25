@@ -16,13 +16,13 @@ from linkmon.dashboard import (
     SEVERITY_FLOOR,
     _range_bounds,
     build_figure,
-    build_outage_figure,
     build_heatmap,
     create_app,
     filter_rows,
     load_view,
     loss_severity,
     outage_list,
+    outage_timeline,
     outage_summary,
     ping_limits,
     ping_severity,
@@ -112,26 +112,25 @@ def _view(config: Config, store: Store, start: datetime, end: datetime):
     return load_view(config, store, start, end, end, cache=None)
 
 
-def test_outage_figure_marks_every_outage_and_gap(config: Config, seeded: tuple[Store, datetime, datetime]) -> None:
+def test_outage_timeline_marks_every_outage_and_gap(config: Config, seeded: tuple[Store, datetime, datetime]) -> None:
     store, start, end = seeded
     view = _view(config, store, start, end)
-    figure = build_outage_figure(view["outages"], view["gaps"], view["start"], view["end"], config.zone)
-    names = {trace.name for trace in figure.data}
-    assert {"Leitung (Vodafone)", "Router/LAN", "Nur DNS", KIND_GAP} <= names
-    marks = next(trace for trace in figure.data if trace.name == "Leitung (Vodafone)")
-    assert marks.mode == "markers" and "Dauer 30 min" in marks.hovertext[0]
-    # Grün nur, wo gemessen wurde: Die eingebaute Lücke unterbricht die Zeile.
-    ok = next(trace for trace in figure.data if trace.name == "Leitung (Vodafone) ok")
-    assert list(ok.x).count(None) == 2
+    timeline = outage_timeline(view["outages"], view["gaps"], view["start"], view["end"], config.zone)
+    rows = {row.to_plotly_json()["props"].get("data-row"): row for row in timeline.children}
+    assert {"line", "router", "dns", KIND_GAP} <= set(rows)
+    hits = [mark for mark in rows["line"].children[1].children if mark.className == "tl-hit"]
+    assert len(hits) == 1 and "30 min" in hits[0].title
+    # Grün nur, wo gemessen wurde: Die eingebaute Lücke teilt die Zeile in zwei Stücke.
+    assert sum(1 for mark in rows["line"].children[1].children if mark.className == "tl-ok") == 2
 
 
-def test_outage_figure_is_compact_and_static_on_mobile(config: Config) -> None:
-    start = datetime(2026, 11, 1, tzinfo=config.zone)
-    end = start + timedelta(days=1)
-    figure = build_outage_figure([], [], start, end, config.zone, mobile=True)
-    assert figure.layout.dragmode is False
-    assert figure.layout.xaxis.fixedrange is True
-    assert list(figure.layout.yaxis.categoryarray) == ["Leitung"]  # Leitung steht immer da, auch ohne Ausfall.
+def test_outage_timeline_always_shows_the_line_and_round_ticks(config: Config) -> None:
+    start = datetime(2026, 11, 1, 10, 0, tzinfo=config.zone)
+    timeline = outage_timeline([], [], start, start + timedelta(days=1), config.zone)
+    rows = [row.to_plotly_json()["props"].get("data-row") for row in timeline.children]
+    assert rows == ["line", None]  # Leitung immer, dazu die Zeitachse
+    ticks = [tick.children[0].children for tick in timeline.children[-1].children[1].children]
+    assert ticks == ["12:00", "18:00", "00:00", "06:00"]
 
 
 def test_detail_figure_shows_chosen_tracks_only(config: Config, seeded: tuple[Store, datetime, datetime]) -> None:
