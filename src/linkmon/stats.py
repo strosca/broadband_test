@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 
 from linkmon.levels import LEVEL_ORDER, Level
@@ -112,6 +113,37 @@ def compute_coverage(timestamps: list[datetime], start: datetime, end: datetime,
     if (end - timestamps[-1]).total_seconds() > gap_threshold_s:
         gaps.append((timestamps[-1], end))
     return Coverage(monitored, gaps, by_day, len(timestamps))
+
+
+def coverage_from_series(stamps: pd.Series, start: datetime, end: datetime, gap_threshold_s: float,
+                         zone: ZoneInfo) -> Coverage:
+    """Wie compute_coverage, aber auf der ganzen Zeitspalte auf einmal statt Runde für Runde.
+
+    Bei 7 Tagen im 3-Sekunden-Takt sind das 200.000 Runden: einzeln in Python fast eine Sekunde,
+    so wenige Millisekunden. In Python umgewandelt werden nur die Ränder der Messlücken.
+    """
+    if stamps.empty:
+        return compute_coverage([], start, end, gap_threshold_s, zone)
+    start = start.astimezone(UTC)
+    end = end.astimezone(UTC)
+    utc = stamps.dt.tz_convert("UTC")
+    nanos = utc.dt.tz_localize(None).to_numpy().astype("datetime64[ns]").astype(np.int64)
+    deltas = np.diff(nanos) / 1e9
+    inside = deltas <= gap_threshold_s
+    first, last = utc.iloc[0].to_pydatetime(), utc.iloc[-1].to_pydatetime()
+    gaps: list[tuple[datetime, datetime]] = []
+    if (first - start).total_seconds() > gap_threshold_s:
+        gaps.append((start, first))
+    for index in np.flatnonzero(~inside):
+        gaps.append((utc.iloc[index].to_pydatetime(), utc.iloc[index + 1].to_pydatetime()))
+    if (end - last).total_seconds() > gap_threshold_s:
+        gaps.append((last, end))
+    # Lokaler Kalendertag je Runde als ganze Zahl (Tage seit 1970 nach Wanduhr), erst am Ende als Text.
+    wall = utc.dt.tz_convert(zone).dt.tz_localize(None).to_numpy().astype("datetime64[D]")[:-1]
+    days, positions = np.unique(wall[inside], return_inverse=True)
+    sums = np.bincount(positions, weights=deltas[inside], minlength=len(days)) if len(days) else np.array([])
+    by_day = {str(day): float(total) for day, total in zip(days, sums)}
+    return Coverage(float(deltas[inside].sum()), gaps, by_day, len(stamps))
 
 
 def load_coverage(store: Store, start: datetime, end: datetime, gap_threshold_s: float, zone: ZoneInfo) -> Coverage:

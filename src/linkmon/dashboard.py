@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+from collections import OrderedDict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -38,7 +39,7 @@ from linkmon.quality import (
     track_stats,
 )
 from linkmon.linestats import dropouts_from_samples
-from linkmon.stats import Coverage, Outage, compute_coverage, load_outages, total_seconds
+from linkmon.stats import Coverage, Outage, coverage_from_series, load_outages, total_seconds
 from linkmon.store import Store
 from linkmon.timeutil import format_duration, format_local, iso_utc, now_utc, parse_iso
 
@@ -446,16 +447,23 @@ def build_figure(samples: pd.DataFrame, outages: list[Outage], gaps: list[tuple[
             hovertemplate="%{x|%d.%m. %H:%M}: %{customdata:.2f} % Verlust<extra>" + track.label + "</extra>", ygap=3,
         ), row=2, col=1)
 
+    # Alle Flächen auf einmal setzen: add_vrect prüft bei jedem Aufruf alle bisherigen Flächen erneut,
+    # bei 60 Ausfällen kostete das über drei Sekunden.
+    shapes: list[dict[str, Any]] = []
     if len(chosen) == 1 and tables:
-        figure.add_hrect(y0=0, y1=tables[0][3], fillcolor=COLOR_OK, opacity=0.08, line_width=0, layer="below",
-                         row=1, col=1)
+        shapes.append({"type": "rect", "xref": "x domain", "yref": "y", "x0": 0, "x1": 1, "y0": 0,
+                       "y1": tables[0][3], "fillcolor": COLOR_OK, "opacity": 0.08, "line": {"width": 0},
+                       "layer": "below"})
     for outage in outages:
-        figure.add_vrect(x0=_naive(outage.start, zone), x1=_naive(outage.end, zone), row=1, col=1,
-                         fillcolor=LEVEL_COLORS_DARK.get(outage.level, COLOR_INK_2), opacity=0.25,
-                         line_width=1, line_color=LEVEL_COLORS_DARK.get(outage.level, COLOR_INK_2), layer="below")
+        color = LEVEL_COLORS_DARK.get(outage.level, COLOR_INK_2)
+        shapes.append({"type": "rect", "xref": "x", "yref": "y domain", "y0": 0, "y1": 1,
+                       "x0": _naive(outage.start, zone), "x1": _naive(outage.end, zone), "fillcolor": color,
+                       "opacity": 0.25, "line": {"width": 1, "color": color}, "layer": "below"})
     for begin, finish in gaps:
-        figure.add_vrect(x0=_naive(begin, zone), x1=_naive(finish, zone), row=1, col=1, fillcolor=COLOR_GAP,
-                         opacity=0.4, line_width=0, layer="below")
+        shapes.append({"type": "rect", "xref": "x", "yref": "y domain", "y0": 0, "y1": 1,
+                       "x0": _naive(begin, zone), "x1": _naive(finish, zone), "fillcolor": COLOR_GAP,
+                       "opacity": 0.4, "line": {"width": 0}, "layer": "below"})
+    figure.update_layout(shapes=shapes)
 
     figure.update_layout(height=ping_px + strip_px + 70, margin={"l": 44 if mobile else 54, "r": 12, "t": 30, "b": 10},
                          uirevision=revision, showlegend=False, **_interaction(mobile), **_base_layout())
@@ -901,9 +909,8 @@ def load_view(config: Config, store: Store, start: datetime, end: datetime, now:
     if finish <= first:
         first = finish - timedelta(hours=1)
     samples = load_samples(store, first, finish, cache)
-    stamps = [moment.to_pydatetime() for moment in samples["ts"]] if not samples.empty else []
     threshold = monitor_gap_threshold(config.reachability.interval_s)
-    coverage = compute_coverage(stamps, first, finish, threshold, config.zone)
+    coverage = coverage_from_series(samples["ts"], first, finish, threshold, config.zone)
     outages = load_outages(store, first, finish, now=now)
     outages = sorted(outages + dropouts_from_samples(samples, outages, threshold), key=lambda item: item.start)
     gaps = coverage.gaps if coverage.cycles else []
@@ -1045,12 +1052,29 @@ def create_app(config: Config) -> Dash:
         timeline = outage_timeline(view["outages"], view["gaps"], view["start"], view["end"], zone)
         return overview, timeline, outage_summary(view["outages"]), outage_list(view["outages"], zone)
 
+    views: OrderedDict[tuple[Any, ...], tuple[dict[str, Any], datetime]] = OrderedDict()
+    views_lock = threading.Lock()
+
     def _view(choice: str, custom_start: str | None, custom_end: str | None, *,
               all_stats: bool) -> tuple[Store, dict[str, Any], datetime]:
-        now = now_utc()
-        start, end = _range_bounds(choice, custom_start, custom_end, zone, now)
+        """Geladener Zeitraum, geteilt zwischen Startansicht und Details.
+
+        Beide Abrufe kommen beim Wechsel des Zeitraums gleichzeitig. Der zweite wartet am Lock und nimmt dann
+        das Ergebnis des ersten, solange keine neue Prüfrunde dazukam. Alle Strecken werden gleich mitgerechnet,
+        das kostet neben dem Laden kaum etwas.
+        """
         store = Store(config.store_dir, readonly=True)
-        return store, load_view(config, store, start, end, now, all_stats=all_stats), now
+        key = (choice, custom_start, custom_end, store.last_cycle_time(), len(store.outages()))
+        with views_lock:
+            cached = views.get(key)
+            if cached is None:
+                now = now_utc()
+                start, end = _range_bounds(choice, custom_start, custom_end, zone, now)
+                cached = (load_view(config, store, start, end, now, all_stats=True), now)
+                views[key] = cached
+                while len(views) > 4:
+                    views.popitem(last=False)
+        return store, cached[0], cached[1]
 
     @app.callback(
         Output("overview", "children"), Output("outage-timeline", "children"), Output("outage-note", "children"),

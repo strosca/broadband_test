@@ -142,3 +142,28 @@ def test_open_outage_ends_at_last_heartbeat_and_is_marked(config: Config, store:
     assert outage.duration_s == 120
 
 
+
+
+def test_vectorised_coverage_matches_the_loop() -> None:
+    from zoneinfo import ZoneInfo
+
+    import pandas as pd
+
+    from datetime import UTC
+
+    from linkmon.stats import compute_coverage, coverage_from_series
+
+    zone = ZoneInfo("Europe/Berlin")
+    # Über die Zeitumstellung am 26.10.2025, mit einer Lücke und Rändern vor und nach den Runden.
+    start = datetime(2025, 10, 25, 20, tzinfo=UTC)
+    stamps = [start + timedelta(minutes=5) + timedelta(seconds=3 * i) for i in range(20000)]
+    stamps = stamps[:9000] + stamps[9400:]
+    end = stamps[-1] + timedelta(minutes=10)
+    loop = compute_coverage(stamps, start, end, 9, zone)
+    fast = coverage_from_series(pd.Series(pd.to_datetime(stamps, utc=True)), start, end, 9, zone)
+    assert fast.gaps == loop.gaps and fast.cycles == loop.cycles
+    assert abs(fast.monitored_s - loop.monitored_s) < 1e-6
+    assert fast.monitored_by_day.keys() == loop.monitored_by_day.keys()
+    assert all(abs(fast.monitored_by_day[day] - loop.monitored_by_day[day]) < 1e-6 for day in loop.monitored_by_day)
+    empty = coverage_from_series(pd.Series(pd.to_datetime([], utc=True)), start, end, 9, zone)
+    assert empty.gaps == [(start, end)]
